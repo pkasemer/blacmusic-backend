@@ -43,6 +43,9 @@ type Deps struct {
 // Handler builds the full HTTP router.
 func Handler(d Deps) http.Handler {
 	r := chi.NewRouter()
+	if d.Cfg.TrustProxy {
+		r.Use(chimw.RealIP) // so rate limits see the visitor, not the proxy
+	}
 	r.Use(chimw.RequestID, chimw.Recoverer, chimw.Timeout(30*time.Second))
 
 	r.Get("/healthz", func(w http.ResponseWriter, _ *http.Request) {

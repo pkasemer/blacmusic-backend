@@ -46,6 +46,12 @@ type Config struct {
 	FFmpegPath         string
 	FFprobePath        string
 
+	// TrustProxy makes the API believe X-Real-IP / X-Forwarded-For. Enable it only
+	// when every request comes through a reverse proxy that overwrites those
+	// headers (the API port must not be reachable any other way), otherwise
+	// clients could fake their address and dodge the rate limits.
+	TrustProxy bool
+
 	// Public identity and mail (API only).
 	PublicAPIURL     string // base URL clients reach the API at; used in image links
 	FreeStorageBytes int64  // free storage every artist starts with
@@ -162,6 +168,9 @@ func load(needJWT bool) (Config, error) {
 		return c, fmt.Errorf("WORKER_CONCURRENCY must be 1-16")
 	}
 
+	if c.TrustProxy, err = getBool("TRUST_PROXY", false); err != nil {
+		return c, err
+	}
 	if c.FeedAllowPrivate, err = getBool("FEED_ALLOW_PRIVATE", false); err != nil {
 		return c, err
 	}
