@@ -38,20 +38,20 @@ curl http://localhost:8080/v1/search?q=demo -H "Authorization: Bearer <accessTok
 curl http://localhost:8080/v1/playback/trk_demo -H "Authorization: Bearer <accessToken>"
 ```
 
-## Uploading audio
+## Artist mode and uploads
 
-Only users with role `creator` or `admin` can upload. Promote an account (operator action, no endpoint yet):
+Anyone can become an artist: verify your email (a 6-digit code), create an artist profile (10 GB free storage),
+then upload. Full contract: `backend-api-artist-mode.md` in the notes folder.
 
-```powershell
-docker compose exec -T postgres psql -U blac -d blac -c "UPDATE users SET role='creator' WHERE email='you@example.com'"
-```
-
-Flow (details in the shared notes, `backend-api-uploads-quality.md`):
-
-1. `POST /v1/uploads` with title, artistName, filename, sizeBytes returns a presigned **PUT** URL.
-2. The client PUTs the file straight to object storage (it never passes through the API).
-3. `POST /v1/uploads/{id}/complete` queues it.
-4. The `worker` container probes the file and transcodes it once into three AAC-LC `.m4a` renditions, then creates the track:
+1. `POST /v1/auth/email/send-code`, `POST /v1/auth/email/verify {code}`. Without `SMTP_HOST` (development) the code is
+   written to the API log: `docker compose logs api`.
+2. `POST /v1/artists`, then optionally an avatar and a cover (`POST /v1/images`, PUT the file, `.../complete`; images are
+   validated and re-encoded, EXIF dropped, served publicly from `/v1/media/...`).
+3. `POST /v1/releases` (single or album, starts as a **draft**).
+4. `POST /v1/uploads` (confirm you own the rights) returns a presigned **PUT** URL; the file goes straight to object
+   storage; `POST /v1/uploads/{id}/complete` queues it. Quota is reserved up front (402 `quota_exceeded` when it does not fit).
+5. The `worker` container probes the file and transcodes it once into three AAC-LC `.m4a` renditions, then creates the
+   track inside the release:
 
 | quality | bitrate | per hour | use |
 |---|---|---|---|
@@ -59,7 +59,22 @@ Flow (details in the shared notes, `backend-api-uploads-quality.md`):
 | `medium` | 128 kbps | ~58 MB | standard listening (default) |
 | `high` | 256 kbps | ~115 MB | best quality |
 
-5. `GET /v1/playback/{trackId}?quality=low|medium|high` returns a presigned URL for that rendition (default medium) plus the list of available qualities with sizes. Originals are kept privately under `originals/` and never served.
+6. `POST /v1/releases/{id}/publish` (now, or with `publishAt` to schedule) makes the release and its tracks public.
+   Drafts are visible to the owning artist only (search, lookup, playback, library, playlists).
+7. `GET /v1/playback/{trackId}?quality=low|medium|high` returns a presigned URL for that rendition (default medium) plus
+   the available qualities with sizes. Originals are kept privately under `originals/` and never served.
+
+Storage is counted from the original files only. The verified badge is requested with
+`POST /v1/artists/{id}/verification-request` and decided by an admin (`/v1/admin/...`). Make an admin with SQL:
+
+```powershell
+docker compose exec -T postgres psql -U blac -d blac -c "UPDATE users SET role='admin' WHERE email='you@example.com'"
+```
+
+Real email: set `SMTP_HOST`, `SMTP_PORT` (587, STARTTLS), `SMTP_USER`, `SMTP_PASSWORD`, `SMTP_FROM`. Any SMTP provider works
+(Amazon SES, Mailgun, Resend, ...). The API refuses to start outside development without `SMTP_HOST`.
+`PUBLIC_API_URL` is the address apps use to reach the API (used in image links); for the Android emulator set it to
+`http://10.0.2.2:8080`.
 
 ## Podcasts
 
@@ -96,8 +111,14 @@ internal/catalog/     search + track metadata
 internal/playback/    resolves a track to a PlaybackDescriptor with source fallback
 internal/storage/     S3 client, presigned GET/PUT, stat, download, upload
 internal/media/       quality ladder, ffprobe validation, ffmpeg transcoding
-internal/upload/      upload API (creator role) and the processing queue in Postgres
-internal/worker/      claims queued uploads and runs probe -> transcode -> store -> create track
+internal/artist/      artist profiles, verification requests, storage quota ledger
+internal/release/     releases (draft/scheduled/public), track edit and delete
+internal/image/       avatar and cover upload, validation, re-encoding, public serving
+internal/mailer/      verification emails (SMTP, or logged in development)
+internal/admin/       review queue and manual storage grants
+internal/upload/      upload API (artist, quota, rights) and the processing queue in Postgres
+internal/worker/      claims queued uploads (probe -> transcode -> store -> create track) and runs maintenance
+                      (scheduled releases go live, abandoned uploads are cleaned up)
 internal/podcast/     RSS parsing, SSRF-safe fetching, shows/episodes/subscriptions/progress, background refresher
 internal/source/podcast/  playback provider for episodes
 cmd/worker/           the transcoding worker and feed refresher (the only image with ffmpeg)
@@ -114,8 +135,10 @@ Implement `source.Provider`, register it in `cmd/api/main.go`, and add `track_so
 Auth (register, login, refresh, logout, me), search, track lookup, playback resolve, readiness checks,
 playlists (CRUD, ordered items, add/remove/move, private or public), library (liked tracks, saved albums,
 followed artists, bulk `contains` check), creator uploads with low/medium/high transcoding and
-quality-aware playback, podcasts (RSS ingest, subscriptions, resume progress, background refresh).
-Not yet: podcast discovery directory, new-episode notifications, listen-together, admin UI, album/artist detail endpoints, cover art, upload cleanup of abandoned files.
+quality-aware playback, podcasts (RSS ingest, subscriptions, resume progress, background refresh), email verification,
+artist profiles with verification requests, releases with draft/schedule/publish, images, storage quota, admin review.
+Not yet: resumable multipart upload, loudness, play events and stats, offline downloads, reports and takedowns,
+web billing, podcast discovery directory, new-episode notifications, listen-together, admin UI, album/artist detail endpoints, cover art, upload cleanup of abandoned files.
 
 ## Tests
 

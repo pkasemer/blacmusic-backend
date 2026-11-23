@@ -2,7 +2,9 @@
 package blobtest
 
 import (
+	"bytes"
 	"context"
+	"io"
 	"os"
 	"sync"
 	"time"
@@ -79,4 +81,12 @@ func (m *Mem) Remove(_ context.Context, key string) error {
 	defer m.mu.Unlock()
 	delete(m.data, key)
 	return nil
+}
+
+func (m *Mem) Open(_ context.Context, key string) (io.ReadCloser, int64, error) {
+	b, ok := m.Get(key)
+	if !ok {
+		return nil, 0, storage.ErrNotFound
+	}
+	return io.NopCloser(bytes.NewReader(b)), int64(len(b)), nil
 }

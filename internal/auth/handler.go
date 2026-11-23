@@ -5,6 +5,7 @@ import (
 	"errors"
 	"log/slog"
 	"net/http"
+	"strconv"
 	"strings"
 
 	"github.com/blacmusic/backend/internal/httpx"
@@ -103,7 +104,15 @@ func (h *Handler) Me(w http.ResponseWriter, r *http.Request) {
 
 func (h *Handler) fail(w http.ResponseWriter, err error) {
 	var ve *ValidationError
+	var soon *TooSoonError
 	switch {
+	case errors.As(err, &soon):
+		w.Header().Set("Retry-After", strconv.Itoa(int(soon.RetryAfter.Seconds())+1))
+		httpx.Error(w, http.StatusTooManyRequests, "too_soon", "a code was just sent; wait a moment before asking for another")
+	case errors.Is(err, ErrInvalidCode):
+		httpx.Error(w, http.StatusUnprocessableEntity, "invalid_code", err.Error())
+	case errors.Is(err, ErrMailFailed):
+		httpx.Error(w, http.StatusServiceUnavailable, "email_unavailable", err.Error())
 	case errors.As(err, &ve):
 		httpx.Error(w, http.StatusUnprocessableEntity, "validation_error", ve.Msg)
 	case errors.Is(err, ErrEmailTaken):

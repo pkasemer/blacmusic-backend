@@ -12,6 +12,8 @@ import (
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgconn"
 	"github.com/jackc/pgx/v5/pgxpool"
+
+	"github.com/blacmusic/backend/internal/mailer"
 )
 
 var (
@@ -27,11 +29,13 @@ func (e *ValidationError) Error() string { return e.Msg }
 
 // User is the public account shape.
 type User struct {
-	ID          string    `json:"id"`
-	Email       string    `json:"email"`
-	DisplayName string    `json:"displayName"`
-	Role        string    `json:"role"` // user | creator | admin (creators and admins may upload)
-	CreatedAt   time.Time `json:"createdAt"`
+	ID          string `json:"id"`
+	Email       string `json:"email"`
+	DisplayName string `json:"displayName"`
+	Role        string `json:"role"` // user | admin (creator is a legacy value)
+	// EmailVerified is required before a user can turn on artist mode.
+	EmailVerified bool      `json:"emailVerified"`
+	CreatedAt     time.Time `json:"createdAt"`
 }
 
 // TokenPair is returned by register, login and refresh.
@@ -46,7 +50,11 @@ type Service struct {
 	pool       *pgxpool.Pool
 	tokens     *TokenService
 	refreshTTL time.Duration
+	mailer     mailer.Mailer
 }
+
+// SetMailer sets how verification emails are delivered.
+func (s *Service) SetMailer(m mailer.Mailer) { s.mailer = m }
 
 // NewService creates the auth service.
 func NewService(pool *pgxpool.Pool, tokens *TokenService, refreshTTL time.Duration) *Service {
@@ -112,8 +120,8 @@ func (s *Service) Login(ctx context.Context, email, password string) (*User, *To
 	u := &User{}
 	var hash string
 	err := s.pool.QueryRow(ctx,
-		`SELECT id, email, display_name, role, created_at, password_hash FROM users WHERE email=$1`, email).
-		Scan(&u.ID, &u.Email, &u.DisplayName, &u.Role, &u.CreatedAt, &hash)
+		`SELECT id, email, display_name, role, email_verified_at IS NOT NULL, created_at, password_hash FROM users WHERE email=$1`, email).
+		Scan(&u.ID, &u.Email, &u.DisplayName, &u.Role, &u.EmailVerified, &u.CreatedAt, &hash)
 	if errors.Is(err, pgx.ErrNoRows) {
 		CheckPassword(dummy(), password)
 		return nil, nil, ErrInvalidCredentials
@@ -158,8 +166,8 @@ func (s *Service) Logout(ctx context.Context, raw string) error {
 func (s *Service) Me(ctx context.Context, userID string) (*User, error) {
 	u := &User{}
 	err := s.pool.QueryRow(ctx,
-		`SELECT id, email, display_name, role, created_at FROM users WHERE id=$1`, userID).
-		Scan(&u.ID, &u.Email, &u.DisplayName, &u.Role, &u.CreatedAt)
+		`SELECT id, email, display_name, role, email_verified_at IS NOT NULL, created_at FROM users WHERE id=$1`, userID).
+		Scan(&u.ID, &u.Email, &u.DisplayName, &u.Role, &u.EmailVerified, &u.CreatedAt)
 	if errors.Is(err, pgx.ErrNoRows) {
 		return nil, ErrInvalidToken
 	}

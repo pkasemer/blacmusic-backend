@@ -74,6 +74,10 @@ GET  /v1/home                                    (personalised feed)
 WS   /v1/ws                                      (sync, listen-together)
 ```
 
+Artist mode (see the README): every upload belongs to an artist profile and a release; originals count against a per-artist
+storage quota kept as a ledger of grants (`storage_grants`), transcoded copies do not. Content is `draft` until its release is
+published; only public tracks are searchable, playable by others, or savable. Scheduled releases are flipped by the worker.
+
 IDs are Blac Music IDs (`trk_...`, `epi_...` for podcast episodes, `shw_...` for shows); each maps to one or more `(source, sourceId)` rows so the same song can fall back between sources.
 
 ## 6. Data model (core tables)

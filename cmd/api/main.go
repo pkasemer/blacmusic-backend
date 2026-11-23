@@ -15,6 +15,7 @@ import (
 
 	"github.com/blacmusic/backend/internal/config"
 	"github.com/blacmusic/backend/internal/db"
+	"github.com/blacmusic/backend/internal/mailer"
 	"github.com/blacmusic/backend/internal/server"
 	"github.com/blacmusic/backend/internal/source"
 	"github.com/blacmusic/backend/internal/source/native"
@@ -72,9 +73,19 @@ func run() error {
 	reg.Register(native.New(pool, store, cfg.PlaybackURLTTL))
 	reg.Register(podcastsrc.New(pool))
 
+	var mail mailer.Mailer = mailer.Log{}
+	if cfg.SMTPHost != "" {
+		mail, err = mailer.NewSMTP(cfg.SMTPHost, cfg.SMTPPort, cfg.SMTPUser, cfg.SMTPPassword, cfg.SMTPFrom)
+		if err != nil {
+			return err
+		}
+	} else if cfg.Env != "development" {
+		return errors.New("SMTP_HOST must be set outside development")
+	}
+
 	srv := &http.Server{
 		Addr:              cfg.HTTPAddr,
-		Handler:           server.Handler(server.Deps{Cfg: cfg, Pool: pool, Redis: rdb, Store: store, Registry: reg}),
+		Handler:           server.Handler(server.Deps{Cfg: cfg, Pool: pool, Redis: rdb, Store: store, Registry: reg, Mailer: mail}),
 		ReadHeaderTimeout: 10 * time.Second,
 		IdleTimeout:       120 * time.Second,
 	}

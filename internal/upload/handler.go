@@ -11,8 +11,6 @@ import (
 	"unicode/utf8"
 
 	"github.com/go-chi/chi/v5"
-	"github.com/jackc/pgx/v5"
-	"github.com/jackc/pgx/v5/pgxpool"
 
 	"github.com/blacmusic/backend/internal/auth"
 	"github.com/blacmusic/backend/internal/httpx"
@@ -26,53 +24,38 @@ type Blobs interface {
 	Remove(ctx context.Context, key string) error
 }
 
-// Handler serves /v1/uploads. Only creators and admins may use it.
+// Handler serves /v1/uploads. Uploading needs an artist profile.
 type Handler struct {
 	store    *Store
-	pool     *pgxpool.Pool
 	blobs    Blobs
 	maxBytes int64
 	urlTTL   time.Duration
 }
 
 // NewHandler creates the handler.
-func NewHandler(pool *pgxpool.Pool, blobs Blobs, maxBytes int64, urlTTL time.Duration) *Handler {
-	return &Handler{store: NewStore(pool), pool: pool, blobs: blobs, maxBytes: maxBytes, urlTTL: urlTTL}
+func NewHandler(store *Store, blobs Blobs, maxBytes int64, urlTTL time.Duration) *Handler {
+	return &Handler{store: store, blobs: blobs, maxBytes: maxBytes, urlTTL: urlTTL}
 }
 
 // Routes registers the routes on r (already authenticated).
 func (h *Handler) Routes(r chi.Router) {
-	r.Use(h.requireCreator)
 	r.Post("/", h.create)
 	r.Get("/", h.list)
 	r.Get("/{id}", h.get)
 	r.Post("/{id}/complete", h.complete)
-}
-
-func (h *Handler) requireCreator(next http.Handler) http.Handler {
-	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		uid, _ := auth.UserID(r.Context())
-		var role string
-		err := h.pool.QueryRow(r.Context(), `SELECT role FROM users WHERE id = $1`, uid).Scan(&role)
-		if errors.Is(err, pgx.ErrNoRows) || (err == nil && role != "creator" && role != "admin") {
-			httpx.Error(w, http.StatusForbidden, "forbidden", "your account is not allowed to upload")
-			return
-		}
-		if err != nil {
-			serverError(w, err)
-			return
-		}
-		next.ServeHTTP(w, r)
-	})
+	r.Delete("/{id}", h.delete)
 }
 
 type createRequest struct {
-	Title      string `json:"title"`
-	ArtistName string `json:"artistName"`
-	AlbumTitle string `json:"albumTitle"`
-	Explicit   bool   `json:"explicit"`
-	Filename   string `json:"filename"`
-	SizeBytes  int64  `json:"sizeBytes"`
+	ReleaseID      string `json:"releaseId"`
+	Title          string `json:"title"`
+	Genre          string `json:"genre"`
+	TrackNumber    *int   `json:"trackNumber"`
+	Explicit       bool   `json:"explicit"`
+	Filename       string `json:"filename"`
+	SizeBytes      int64  `json:"sizeBytes"`
+	RightsAccepted bool   `json:"rightsAccepted"`
+	TermsVersion   string `json:"termsVersion"`
 }
 
 type uploadTarget struct {
@@ -94,25 +77,45 @@ func (h *Handler) create(w http.ResponseWriter, r *http.Request) {
 		httpx.Error(w, http.StatusBadRequest, "bad_request", "invalid JSON body")
 		return
 	}
-	req.Title = strings.TrimSpace(req.Title)
-	req.ArtistName = strings.TrimSpace(req.ArtistName)
-	req.AlbumTitle = strings.TrimSpace(req.AlbumTitle)
-	req.Filename = strings.TrimSpace(req.Filename)
+	req.Title, req.Genre = strings.TrimSpace(req.Title), strings.TrimSpace(req.Genre)
+	req.Filename, req.TermsVersion = strings.TrimSpace(req.Filename), strings.TrimSpace(req.TermsVersion)
 
 	if msg := h.validate(req); msg != "" {
 		httpx.Error(w, http.StatusUnprocessableEntity, "validation_error", msg)
 		return
 	}
-
-	u, err := h.store.Create(r.Context(), NewUpload{
-		UserID: uid, Title: req.Title, ArtistName: req.ArtistName, AlbumTitle: req.AlbumTitle,
-		Explicit: req.Explicit, Filename: req.Filename, SizeBytes: req.SizeBytes,
-	})
-	if errors.Is(err, ErrLimit) {
-		httpx.Error(w, http.StatusConflict, "limit_reached", "too many unfinished uploads; wait for them to finish")
+	if !req.RightsAccepted {
+		httpx.Error(w, http.StatusUnprocessableEntity, "rights_not_accepted", "you must confirm that you own the rights to this content")
 		return
 	}
-	if err != nil {
+
+	u, err := h.store.Create(r.Context(), NewUpload{
+		UserID: uid, ReleaseID: req.ReleaseID, Title: req.Title, Genre: req.Genre, TrackNumber: req.TrackNumber,
+		Explicit: req.Explicit, Filename: req.Filename, SizeBytes: req.SizeBytes, TermsVersion: req.TermsVersion,
+	})
+	var quota *QuotaError
+	switch {
+	case errors.As(err, &quota):
+		httpx.ErrorDetails(w, http.StatusPaymentRequired, "quota_exceeded",
+			"this file does not fit in your remaining storage", map[string]int64{
+				"requiredBytes": quota.Required, "remainingBytes": quota.Remaining,
+				"limitBytes": quota.Limit, "usedBytes": quota.Used,
+			})
+		return
+	case errors.Is(err, ErrNoArtist):
+		httpx.Error(w, http.StatusForbidden, "artist_required", "create your artist profile before uploading")
+		return
+	case errors.Is(err, ErrReleaseNotFound):
+		httpx.Error(w, http.StatusNotFound, "not_found", "release not found")
+		return
+	case errors.Is(err, ErrLimit):
+		httpx.Error(w, http.StatusConflict, "limit_reached", "too many unfinished uploads; wait for them to finish")
+		return
+	case errors.Is(err, ErrDailyLimit):
+		w.Header().Set("Retry-After", "3600")
+		httpx.Error(w, http.StatusTooManyRequests, "daily_limit", "daily upload limit reached; request verification to lift it")
+		return
+	case err != nil:
 		serverError(w, err)
 		return
 	}
@@ -133,12 +136,14 @@ func (h *Handler) validate(req createRequest) string {
 	switch {
 	case utf8.RuneCountInString(req.Title) < 1 || utf8.RuneCountInString(req.Title) > 200:
 		return "title must be 1-200 characters"
-	case utf8.RuneCountInString(req.ArtistName) < 1 || utf8.RuneCountInString(req.ArtistName) > 100:
-		return "artistName must be 1-100 characters"
-	case utf8.RuneCountInString(req.AlbumTitle) > 200:
-		return "albumTitle must be at most 200 characters"
+	case utf8.RuneCountInString(req.Genre) > 40:
+		return "genre must be at most 40 characters"
+	case req.TrackNumber != nil && (*req.TrackNumber < 1 || *req.TrackNumber > 999):
+		return "trackNumber must be between 1 and 999"
 	case utf8.RuneCountInString(req.Filename) < 1 || utf8.RuneCountInString(req.Filename) > 255:
 		return "filename must be 1-255 characters"
+	case utf8.RuneCountInString(req.TermsVersion) < 1 || utf8.RuneCountInString(req.TermsVersion) > 32:
+		return "termsVersion must be 1-32 characters"
 	case req.SizeBytes < 1:
 		return "sizeBytes is required"
 	case req.SizeBytes > h.maxBytes:
@@ -196,6 +201,25 @@ func (h *Handler) get(w http.ResponseWriter, r *http.Request) {
 	}
 }
 
+// delete cancels an upload that has not become a track (pending or failed),
+// which also returns its reserved storage. A finished upload is removed by
+// deleting its track.
+func (h *Handler) delete(w http.ResponseWriter, r *http.Request) {
+	uid, _ := auth.UserID(r.Context())
+	key, err := h.store.Delete(r.Context(), chi.URLParam(r, "id"), uid)
+	switch {
+	case errors.Is(err, ErrNotFound):
+		httpx.Error(w, http.StatusNotFound, "not_found", "upload not found")
+	case errors.Is(err, ErrInUse):
+		httpx.Error(w, http.StatusConflict, "in_progress", "this upload is already being processed or finished; delete the track instead")
+	case err != nil:
+		serverError(w, err)
+	default:
+		_ = h.blobs.Remove(r.Context(), key)
+		w.WriteHeader(http.StatusNoContent)
+	}
+}
+
 func (h *Handler) list(w http.ResponseWriter, r *http.Request) {
 	uid, _ := auth.UserID(r.Context())
 	limit, offset := 50, 0
@@ -234,23 +258,24 @@ func (h *Handler) owned(w http.ResponseWriter, r *http.Request) (*Upload, bool) 
 
 // view is the public shape of an upload.
 type view struct {
-	ID         string    `json:"id"`
-	Status     Status    `json:"status"`
-	Title      string    `json:"title"`
-	ArtistName string    `json:"artistName"`
-	AlbumTitle string    `json:"albumTitle,omitempty"`
-	Explicit   bool      `json:"explicit"`
-	Filename   string    `json:"filename"`
-	SizeBytes  int64     `json:"sizeBytes"`
-	TrackID    string    `json:"trackId,omitempty"` // set once ready
-	Error      string    `json:"error,omitempty"`   // set when failed
-	CreatedAt  time.Time `json:"createdAt"`
-	UpdatedAt  time.Time `json:"updatedAt"`
+	ID          string    `json:"id"`
+	Status      Status    `json:"status"`
+	ReleaseID   string    `json:"releaseId,omitempty"`
+	Title       string    `json:"title"`
+	Genre       string    `json:"genre,omitempty"`
+	TrackNumber *int      `json:"trackNumber,omitempty"`
+	Explicit    bool      `json:"explicit"`
+	Filename    string    `json:"filename"`
+	SizeBytes   int64     `json:"sizeBytes"`
+	TrackID     string    `json:"trackId,omitempty"` // set once ready
+	Error       string    `json:"error,omitempty"`   // set when failed
+	CreatedAt   time.Time `json:"createdAt"`
+	UpdatedAt   time.Time `json:"updatedAt"`
 }
 
 func toView(u *Upload) view {
 	v := view{
-		ID: u.ID, Status: u.Status, Title: u.Title, ArtistName: u.ArtistName, AlbumTitle: u.AlbumTitle,
+		ID: u.ID, Status: u.Status, ReleaseID: u.ReleaseID, Title: u.Title, Genre: u.Genre, TrackNumber: u.TrackNumber,
 		Explicit: u.Explicit, Filename: u.Filename, SizeBytes: u.SizeBytes, Error: u.Error,
 		CreatedAt: u.CreatedAt, UpdatedAt: u.UpdatedAt,
 	}

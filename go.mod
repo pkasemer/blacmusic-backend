@@ -9,6 +9,7 @@ require (
 	github.com/minio/minio-go/v7 v7.0.80
 	github.com/redis/go-redis/v9 v9.7.0
 	golang.org/x/crypto v0.28.0
+	golang.org/x/image v0.21.0
 	golang.org/x/net v0.30.0
 )
 

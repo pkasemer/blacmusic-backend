@@ -12,6 +12,7 @@ import (
 	"github.com/go-chi/chi/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
 
+	"github.com/blacmusic/backend/internal/auth"
 	"github.com/blacmusic/backend/internal/httpx"
 	"github.com/blacmusic/backend/internal/media"
 	"github.com/blacmusic/backend/internal/source"
@@ -55,7 +56,8 @@ func (h *Handler) Resolve(w http.ResponseWriter, r *http.Request) {
 	if isEpisode {
 		cands = []candidate{{source: "podcast", sourceID: trackID}} // episodes have exactly one source
 	} else {
-		cands, err = h.candidates(r.Context(), trackID)
+		uid, _ := auth.UserID(r.Context())
+		cands, err = h.candidates(r.Context(), trackID, uid)
 	}
 	if err != nil {
 		slog.Error("playback candidates", "err", err)
@@ -93,9 +95,15 @@ func (h *Handler) Resolve(w http.ResponseWriter, r *http.Request) {
 	httpx.Error(w, http.StatusBadGateway, "no_playable_source", "no enabled source could play this track")
 }
 
-func (h *Handler) candidates(ctx context.Context, trackID string) ([]candidate, error) {
-	rows, err := h.pool.Query(ctx,
-		`SELECT source, source_id FROM track_sources WHERE track_id = $1 ORDER BY priority, source`, trackID)
+// candidates lists a track's sources. A track that is not public is playable
+// only by the artist who owns it (to preview a draft).
+func (h *Handler) candidates(ctx context.Context, trackID, viewer string) ([]candidate, error) {
+	rows, err := h.pool.Query(ctx, `
+		SELECT ts.source, ts.source_id FROM track_sources ts
+		JOIN tracks t ON t.id = ts.track_id
+		LEFT JOIN artists a ON a.id = t.artist_id
+		WHERE ts.track_id = $1 AND (t.visibility = 'public' OR a.owner_user_id::text = $2)
+		ORDER BY ts.priority, ts.source`, trackID, viewer)
 	if err != nil {
 		return nil, err
 	}

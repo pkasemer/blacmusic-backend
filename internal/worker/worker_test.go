@@ -16,8 +16,9 @@ import (
 	"github.com/jackc/pgx/v5/pgxpool"
 
 	"github.com/blacmusic/backend/internal/blobtest"
-	"github.com/blacmusic/backend/internal/db"
 	"github.com/blacmusic/backend/internal/media"
+	"github.com/blacmusic/backend/internal/release"
+	"github.com/blacmusic/backend/internal/testutil"
 	"github.com/blacmusic/backend/internal/upload"
 )
 
@@ -25,41 +26,25 @@ import (
 //
 //	apk add ffmpeg && TEST_DATABASE_URL=postgres://... go test ./internal/worker
 type env struct {
-	t     *testing.T
-	pool  *pgxpool.Pool
-	store *upload.Store
-	blobs *blobtest.Mem
-	w     *Worker
-	uid   string
+	t        *testing.T
+	pool     *pgxpool.Pool
+	store    *upload.Store
+	blobs    *blobtest.Mem
+	w        *Worker
+	uid      string
+	artistID string
 }
 
 func setup(t *testing.T) *env {
 	t.Helper()
-	url := os.Getenv("TEST_DATABASE_URL")
-	if url == "" {
-		t.Skip("TEST_DATABASE_URL not set")
-	}
 	for _, bin := range []string{"ffmpeg", "ffprobe"} {
 		if _, err := exec.LookPath(bin); err != nil {
 			t.Skipf("%s not installed", bin)
 		}
 	}
-	ctx := context.Background()
-	pool, err := db.Connect(ctx, url)
-	if err != nil {
-		t.Fatal(err)
-	}
-	t.Cleanup(pool.Close)
-	if err := db.Migrate(ctx, pool); err != nil {
-		t.Fatal(err)
-	}
-	var uid string
-	if err := pool.QueryRow(ctx,
-		`INSERT INTO users(email, password_hash, display_name, role) VALUES ($1,'x','W','creator') RETURNING id::text`,
-		fmt.Sprintf("wk-%d@test.local", time.Now().UnixNano())).Scan(&uid); err != nil {
-		t.Fatal(err)
-	}
-	t.Cleanup(func() { pool.Exec(ctx, `DELETE FROM users WHERE id::text = $1`, uid) }) //nolint:errcheck
+	pool := testutil.Pool(t)
+	uid := testutil.User(t, pool, "user", true)
+	artistID := testutil.Artist(t, pool, uid, testutil.Unique("Worker Artist"), testutil.GiB)
 
 	store := upload.NewStore(pool)
 	blobs := blobtest.New()
@@ -67,25 +52,21 @@ func setup(t *testing.T) *env {
 		FFmpeg: "ffmpeg", FFprobe: "ffprobe",
 		MaxBytes: 50 << 20, MaxDuration: time.Hour, TranscodeTimeout: time.Minute,
 	})
-	return &env{t: t, pool: pool, store: store, blobs: blobs, w: w, uid: uid}
+	return &env{t: t, pool: pool, store: store, blobs: blobs, w: w, uid: uid, artistID: artistID}
 }
 
-// submit creates an upload, "uploads" data as its original and claims it.
-func (e *env) submit(artist, album string, data []byte) *upload.Upload {
+// submit creates an upload (into releaseID, or a new draft single when empty),
+// "uploads" data as its original and claims it.
+func (e *env) submit(releaseID string, data []byte) *upload.Upload {
 	e.t.Helper()
 	ctx := context.Background()
 	u, err := e.store.Create(ctx, upload.NewUpload{
-		UserID: e.uid, Title: "Test Song", ArtistName: artist, AlbumTitle: album,
-		Filename: "x", SizeBytes: int64(len(data)),
+		UserID: e.uid, ReleaseID: releaseID, Title: "Test Song", Filename: "x",
+		SizeBytes: int64(len(data)), TermsVersion: "test",
 	})
 	if err != nil {
 		e.t.Fatal(err)
 	}
-	e.t.Cleanup(func() {
-		e.pool.Exec(ctx, `DELETE FROM tracks WHERE id = $1`, u.TrackID)                                          //nolint:errcheck
-		e.pool.Exec(ctx, `DELETE FROM albums WHERE artist_id IN (SELECT id FROM artists WHERE name=$1)`, artist) //nolint:errcheck
-		e.pool.Exec(ctx, `DELETE FROM artists WHERE name = $1`, artist)                                          //nolint:errcheck
-	})
 	e.blobs.Put(u.OriginalKey, data)
 	if _, err := e.store.Queue(ctx, u.ID); err != nil {
 		e.t.Fatal(err)
@@ -157,24 +138,24 @@ func probe(t *testing.T, data []byte) probed {
 func TestProcessProducesLowMediumHigh(t *testing.T) {
 	e := setup(t)
 	ctx := context.Background()
-	artist := fmt.Sprintf("Artist %d", time.Now().UnixNano())
-	job := e.submit(artist, "The Album", tone(t, 6, 2))
+	rel := testutil.Release(t, e.pool, e.artistID, "The Album", "album", "draft")
+	job := e.submit(rel, tone(t, 6, 2))
 
 	if err := e.w.Process(ctx, job); err != nil {
 		t.Fatal(err)
 	}
 
-	// Track, artist, album and renditions exist, and the upload is ready.
-	var title, artistName, albumTitle string
+	// The track sits in the release under the artist's profile, as a draft.
+	var title, artistName, albumTitle, visibility string
 	var durMs int
 	if err := e.pool.QueryRow(ctx, `
-		SELECT t.title, a.name, al.title, t.duration_ms FROM tracks t
+		SELECT t.title, a.name, al.title, t.duration_ms, t.visibility FROM tracks t
 		JOIN artists a ON a.id=t.artist_id JOIN albums al ON al.id=t.album_id WHERE t.id=$1`, job.TrackID).
-		Scan(&title, &artistName, &albumTitle, &durMs); err != nil {
+		Scan(&title, &artistName, &albumTitle, &durMs, &visibility); err != nil {
 		t.Fatal(err)
 	}
-	if title != "Test Song" || artistName != artist || albumTitle != "The Album" {
-		t.Fatalf("metadata = %q %q %q", title, artistName, albumTitle)
+	if title != "Test Song" || albumTitle != "The Album" || artistName == "" || visibility != "draft" {
+		t.Fatalf("metadata = %q %q %q %q", title, artistName, albumTitle, visibility)
 	}
 	if durMs < 5900 || durMs > 6300 {
 		t.Fatalf("duration_ms = %d, want about 6000", durMs)
@@ -231,7 +212,7 @@ func TestProcessProducesLowMediumHigh(t *testing.T) {
 
 func TestMonoStaysMono(t *testing.T) {
 	e := setup(t)
-	job := e.submit(fmt.Sprintf("Mono %d", time.Now().UnixNano()), "", tone(t, 3, 1))
+	job := e.submit("", tone(t, 3, 1))
 	if err := e.w.Process(context.Background(), job); err != nil {
 		t.Fatal(err)
 	}
@@ -241,28 +222,64 @@ func TestMonoStaysMono(t *testing.T) {
 	}
 }
 
-func TestReusesArtistAndAlbum(t *testing.T) {
+func TestTracksJoinTheirReleaseAndGoLiveWithIt(t *testing.T) {
 	e := setup(t)
 	ctx := context.Background()
-	artist := fmt.Sprintf("Same Artist %d", time.Now().UnixNano())
+	rel := testutil.Release(t, e.pool, e.artistID, "Two Tracks", "album", "draft")
 	audio := tone(t, 2, 2)
-	a := e.submit(artist, "Same Album", audio)
+
+	a := e.submit(rel, audio)
 	if err := e.w.Process(ctx, a); err != nil {
 		t.Fatal(err)
 	}
-	b := e.submit(artist, "same album", audio) // different case
+	b := e.submit(rel, audio)
 	if err := e.w.Process(ctx, b); err != nil {
 		t.Fatal(err)
 	}
-	var artists, albums int
-	if err := e.pool.QueryRow(ctx, `SELECT count(*) FROM artists WHERE name=$1`, artist).Scan(&artists); err != nil {
+	var n int
+	if err := e.pool.QueryRow(ctx, `SELECT count(*) FROM tracks WHERE album_id=$1 AND visibility='draft'`, rel).Scan(&n); err != nil || n != 2 {
+		t.Fatalf("draft tracks in the release = %d (%v), want 2", n, err)
+	}
+
+	// Publishing the release makes both public...
+	rs := release.NewStore(e.pool, e.blobs, "http://api.test")
+	if _, err := rs.Publish(ctx, rel, e.uid, nil); err != nil {
 		t.Fatal(err)
 	}
-	if err := e.pool.QueryRow(ctx, `SELECT count(DISTINCT album_id) FROM tracks WHERE id = ANY($1)`, []string{a.TrackID, b.TrackID}).Scan(&albums); err != nil {
+	if err := e.pool.QueryRow(ctx, `SELECT count(*) FROM tracks WHERE album_id=$1 AND visibility='public'`, rel).Scan(&n); err != nil || n != 2 {
+		t.Fatalf("public tracks after publish = %d (%v), want 2", n, err)
+	}
+	// ...and a track added to a live release is public as soon as it is processed.
+	c := e.submit(rel, audio)
+	if err := e.w.Process(ctx, c); err != nil {
 		t.Fatal(err)
 	}
-	if artists != 1 || albums != 1 {
-		t.Fatalf("artists=%d albums=%d, want 1 and 1", artists, albums)
+	var vis string
+	if err := e.pool.QueryRow(ctx, `SELECT visibility FROM tracks WHERE id=$1`, c.TrackID).Scan(&vis); err != nil || vis != "public" {
+		t.Fatalf("late track visibility = %q (%v), want public", vis, err)
+	}
+}
+
+func TestReleaseDeletedWhileQueuedFailsTheUpload(t *testing.T) {
+	e := setup(t)
+	ctx := context.Background()
+	rel := testutil.Release(t, e.pool, e.artistID, "Gone Soon", "album", "draft")
+	job := e.submit(rel, tone(t, 2, 2))
+	// The release disappears after the upload was claimed (e.g. an old claim).
+	if _, err := e.pool.Exec(ctx, `UPDATE uploads SET release_id = NULL WHERE id=$1`, job.ID); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := e.pool.Exec(ctx, `DELETE FROM albums WHERE id=$1`, rel); err != nil {
+		t.Fatal(err)
+	}
+	job.ReleaseID = rel
+	var inv *media.InvalidMediaError
+	if err := e.w.Process(ctx, job); !errors.As(err, &inv) {
+		t.Fatalf("err = %v, want InvalidMediaError (permanent failure)", err)
+	}
+	var n int
+	if err := e.pool.QueryRow(ctx, `SELECT count(*) FROM tracks WHERE id=$1`, job.TrackID).Scan(&n); err != nil || n != 0 {
+		t.Fatal("no track may be created for a deleted release")
 	}
 }
 
@@ -276,7 +293,7 @@ func TestRejectsFilesThatAreNotAudio(t *testing.T) {
 		"random":      append([]byte{0xff, 0x00, 0x13}, make([]byte, 4096)...),
 	}
 	for name, data := range cases {
-		job := e.submit(fmt.Sprintf("Bad %s %d", name, time.Now().UnixNano()), "", data)
+		job := e.submit("", data)
 		err := e.w.Process(ctx, job)
 		var inv *media.InvalidMediaError
 		if !errors.As(err, &inv) {
@@ -289,10 +306,10 @@ func TestRejectsFilesThatAreNotAudio(t *testing.T) {
 	}
 }
 
-func TestHandleMarksInvalidUploadsFailed(t *testing.T) {
+func TestHandleMarksInvalidUploadsFailedAndRemovesTheOriginal(t *testing.T) {
 	e := setup(t)
 	ctx := context.Background()
-	job := e.submit(fmt.Sprintf("Handle %d", time.Now().UnixNano()), "", []byte("not audio"))
+	job := e.submit("", []byte("not audio"))
 	e.w.handle(ctx, job)
 	st, err := e.store.Get(ctx, job.ID)
 	if err != nil {
@@ -301,11 +318,14 @@ func TestHandleMarksInvalidUploadsFailed(t *testing.T) {
 	if st.Status != upload.StatusFailed || st.Error == "" {
 		t.Fatalf("status=%s error=%q, want failed with a message", st.Status, st.Error)
 	}
+	if _, ok := e.blobs.Get(job.OriginalKey); ok {
+		t.Fatal("the original of a failed upload must be deleted so it stops using storage")
+	}
 }
 
 func TestMissingOriginalIsRejected(t *testing.T) {
 	e := setup(t)
-	job := e.submit(fmt.Sprintf("Gone %d", time.Now().UnixNano()), "", []byte("x"))
+	job := e.submit("", []byte("x"))
 	_ = e.blobs.Remove(context.Background(), job.OriginalKey)
 	var inv *media.InvalidMediaError
 	if err := e.w.Process(context.Background(), job); !errors.As(err, &inv) {
@@ -317,7 +337,7 @@ func TestTransientErrorRequeuesThenFailsAfterMaxAttempts(t *testing.T) {
 	e := setup(t)
 	ctx := context.Background()
 	e.w.cfg.FFmpeg = "/nonexistent/ffmpeg" // a system failure, not a bad file
-	job := e.submit(fmt.Sprintf("Flaky %d", time.Now().UnixNano()), "", tone(t, 2, 2))
+	job := e.submit("", tone(t, 2, 2))
 
 	e.w.handle(ctx, job)
 	if st, _ := e.store.Get(ctx, job.ID); st.Status != upload.StatusQueued {
@@ -329,3 +349,46 @@ func TestTransientErrorRequeuesThenFailsAfterMaxAttempts(t *testing.T) {
 		t.Fatalf("after final failure status = %s, want failed", st.Status)
 	}
 }
+
+func TestMaintenanceGoesLiveAndExpires(t *testing.T) {
+	e := setup(t)
+	ctx := context.Background()
+	rs := release.NewStore(e.pool, e.blobs, "http://api.test")
+	rel := testutil.Release(t, e.pool, e.artistID, "Scheduled", "album", "draft")
+	testutil.ReadyTrack(t, e.pool, e.uid, e.artistID, rel, "T", 100, "draft")
+	if _, err := rs.Publish(ctx, rel, e.uid, ptrTime(time.Now().Add(time.Hour))); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := e.pool.Exec(ctx, `UPDATE albums SET publish_at = now() - interval '1 minute' WHERE id=$1`, rel); err != nil {
+		t.Fatal(err)
+	}
+	_, pendingID := func() (string, string) {
+		u, err := e.store.Create(ctx, upload.NewUpload{UserID: e.uid, Title: "Abandoned", Filename: "f", SizeBytes: 10, TermsVersion: "v"})
+		if err != nil {
+			t.Fatal(err)
+		}
+		e.blobs.Put(u.OriginalKey, []byte("partial"))
+		return u.OriginalKey, u.ID
+	}()
+	if _, err := e.pool.Exec(ctx, `UPDATE uploads SET created_at = now() - interval '3 hours' WHERE id=$1`, pendingID); err != nil {
+		t.Fatal(err)
+	}
+
+	NewMaintenance(e.pool, e.store, rs, e.blobs, time.Hour).RunOnce(ctx)
+
+	var vis, tvis string
+	if err := e.pool.QueryRow(ctx, `SELECT al.visibility, t.visibility FROM albums al JOIN tracks t ON t.album_id=al.id WHERE al.id=$1`, rel).Scan(&vis, &tvis); err != nil {
+		t.Fatal(err)
+	}
+	if vis != "public" || tvis != "public" {
+		t.Fatalf("scheduled release = %s / track %s, want public / public", vis, tvis)
+	}
+	if st, _ := e.store.Get(ctx, pendingID); st.Status != upload.StatusFailed {
+		t.Fatalf("abandoned upload status = %s, want failed", st.Status)
+	}
+	if _, ok := e.blobs.Get("originals/" + pendingID); ok {
+		t.Fatal("the partial file of an abandoned upload must be deleted")
+	}
+}
+
+func ptrTime(t time.Time) *time.Time { return &t }

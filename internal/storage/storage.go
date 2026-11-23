@@ -5,6 +5,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"io"
 	"time"
 
 	"github.com/minio/minio-go/v7"
@@ -115,4 +116,19 @@ func mapErr(err error) error {
 		return ErrNotFound
 	}
 	return err
+}
+
+// Open streams an object. The caller must close the reader. It returns
+// ErrNotFound when the object does not exist.
+func (s *Store) Open(ctx context.Context, key string) (io.ReadCloser, int64, error) {
+	obj, err := s.internal.GetObject(ctx, s.bucket, key, minio.GetObjectOptions{})
+	if err != nil {
+		return nil, 0, mapErr(err)
+	}
+	st, err := obj.Stat() // GetObject is lazy: a missing key shows up here
+	if err != nil {
+		obj.Close()
+		return nil, 0, mapErr(err)
+	}
+	return obj, st.Size, nil
 }

@@ -13,6 +13,7 @@ type errBody struct {
 type errDetail struct {
 	Code    string `json:"code"`
 	Message string `json:"message"`
+	Details any    `json:"details,omitempty"` // machine-readable extras, e.g. remaining bytes
 }
 
 // JSON writes v as a JSON response with the given status.
@@ -27,6 +28,11 @@ func JSON(w http.ResponseWriter, status int, v any) {
 // Error writes the standard error envelope: {"error":{"code","message"}}.
 func Error(w http.ResponseWriter, status int, code, message string) {
 	JSON(w, status, errBody{Error: errDetail{Code: code, Message: message}})
+}
+
+// ErrorDetails is Error with a machine-readable details object.
+func ErrorDetails(w http.ResponseWriter, status int, code, message string, details any) {
+	JSON(w, status, errBody{Error: errDetail{Code: code, Message: message, Details: details}})
 }
 
 // Decode parses a JSON body (max 1 MiB, unknown fields rejected).

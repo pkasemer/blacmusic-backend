@@ -111,6 +111,7 @@ func (w *Worker) handle(ctx context.Context, u *upload.Upload) {
 		if ferr := w.store.Fail(bg, u.ID, invalid.Msg); ferr != nil {
 			log.Error("mark failed", "err", ferr)
 		}
+		_ = w.blobs.Remove(bg, u.OriginalKey) // a failed upload must not keep using storage
 	case ctx.Err() != nil: // shutting down: let another worker take it
 		log.Info("upload interrupted by shutdown")
 		_ = w.store.Requeue(bg, u.ID)
@@ -119,6 +120,7 @@ func (w *Worker) handle(ctx context.Context, u *upload.Upload) {
 		if ferr := w.store.Fail(bg, u.ID, "processing failed, please upload again"); ferr != nil {
 			log.Error("mark failed", "err", ferr)
 		}
+		_ = w.blobs.Remove(bg, u.OriginalKey)
 	default:
 		log.Error("upload failed, will retry", "err", err)
 		_ = w.store.Requeue(bg, u.ID)
@@ -193,6 +195,9 @@ func (w *Worker) Process(ctx context.Context, u *upload.Upload) error {
 		})
 	}
 	if err := w.store.Finish(ctx, u, res); err != nil {
+		if errors.Is(err, upload.ErrReleaseGone) {
+			return &media.InvalidMediaError{Msg: "the release this file belonged to was deleted"}
+		}
 		return fmt.Errorf("finish: %w", err)
 	}
 	return nil

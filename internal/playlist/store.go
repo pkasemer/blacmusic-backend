@@ -268,6 +268,17 @@ func (s *Store) AddItem(ctx context.Context, id, owner, trackID string, position
 	if err := lockOwned(ctx, tx, id, owner); err != nil {
 		return nil, err
 	}
+	// Only public tracks can be added (an artist may add their own drafts).
+	var addable bool
+	if err := tx.QueryRow(ctx, `
+		SELECT EXISTS (SELECT 1 FROM tracks t LEFT JOIN artists a ON a.id = t.artist_id
+		               WHERE t.id = $1 AND (t.visibility = 'public' OR a.owner_user_id::text = $2))`,
+		trackID, owner).Scan(&addable); err != nil {
+		return nil, err
+	}
+	if !addable {
+		return nil, ErrTrackNotFound
+	}
 	var count int
 	if err := tx.QueryRow(ctx, `SELECT count(*) FROM playlist_items WHERE playlist_id = $1`, id).Scan(&count); err != nil {
 		return nil, err

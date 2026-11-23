@@ -11,15 +11,20 @@ import (
 	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/redis/go-redis/v9"
 
+	"github.com/blacmusic/backend/internal/admin"
+	"github.com/blacmusic/backend/internal/artist"
 	"github.com/blacmusic/backend/internal/auth"
 	"github.com/blacmusic/backend/internal/catalog"
 	"github.com/blacmusic/backend/internal/config"
 	"github.com/blacmusic/backend/internal/httpx"
+	"github.com/blacmusic/backend/internal/image"
 	"github.com/blacmusic/backend/internal/library"
+	"github.com/blacmusic/backend/internal/mailer"
 	"github.com/blacmusic/backend/internal/playback"
 	"github.com/blacmusic/backend/internal/playlist"
 	"github.com/blacmusic/backend/internal/podcast"
 	"github.com/blacmusic/backend/internal/ratelimit"
+	"github.com/blacmusic/backend/internal/release"
 	"github.com/blacmusic/backend/internal/source"
 	"github.com/blacmusic/backend/internal/storage"
 	"github.com/blacmusic/backend/internal/upload"
@@ -32,6 +37,7 @@ type Deps struct {
 	Redis    *redis.Client
 	Store    *storage.Store
 	Registry *source.Registry
+	Mailer   mailer.Mailer
 }
 
 // Handler builds the full HTTP router.
@@ -61,6 +67,7 @@ func Handler(d Deps) http.Handler {
 
 	tokens := auth.NewTokenService(d.Cfg.JWTSecret, d.Cfg.AccessTTL)
 	authSvc := auth.NewService(d.Pool, tokens, d.Cfg.RefreshTTL)
+	authSvc.SetMailer(d.Mailer)
 	authH := auth.NewHandler(authSvc)
 	catalogH := catalog.NewHandler(d.Pool, d.Registry)
 	playbackH := playback.NewHandler(d.Pool, d.Registry)
@@ -68,9 +75,18 @@ func Handler(d Deps) http.Handler {
 	playlistH := playlist.NewHandler(playlist.NewStore(d.Pool))
 	podcastH := podcast.NewHandler(podcast.NewStore(d.Pool,
 		podcast.NewFetcher(d.Cfg.FeedAllowPrivate, d.Cfg.FeedFetchTimeout), d.Cfg.FeedRefreshInterval))
-	uploadH := upload.NewHandler(d.Pool, d.Store, d.Cfg.UploadMaxBytes, d.Cfg.UploadURLTTL)
+	uploadH := upload.NewHandler(upload.NewStore(d.Pool), d.Store, d.Cfg.UploadMaxBytes, d.Cfg.UploadURLTTL)
+	artistStore := artist.NewStore(d.Pool, d.Cfg.FreeStorageBytes, d.Cfg.PublicAPIURL)
+	artistH := artist.NewHandler(artistStore)
+	releaseH := release.NewHandler(release.NewStore(d.Pool, d.Store, d.Cfg.PublicAPIURL))
+	imageH := image.NewHandler(d.Pool, d.Store, d.Cfg.PublicAPIURL)
+	adminH := admin.NewHandler(d.Pool, artistStore)
 
 	r.Route("/v1", func(v1 chi.Router) {
+		// Avatars and cover art are public: apps load them with plain image
+		// requests. Ids are unguessable and the files are re-encoded JPEGs.
+		v1.Route("/media", imageH.ServeRoute)
+
 		v1.Group(func(pub chi.Router) {
 			pub.Use(ratelimit.Middleware(d.Redis, "auth", d.Cfg.AuthRateLimit, d.Cfg.AuthRateWindow))
 			pub.Post("/auth/register", authH.Register)
@@ -82,12 +98,18 @@ func Handler(d Deps) http.Handler {
 		v1.Group(func(priv chi.Router) {
 			priv.Use(auth.Require(tokens))
 			priv.Get("/me", authH.Me)
+			priv.Post("/auth/email/send-code", authH.SendEmailCode)
+			priv.Post("/auth/email/verify", authH.VerifyEmail)
 			priv.Get("/search", catalogH.Search)
 			priv.Get("/tracks/{id}", catalogH.GetTrack)
 			priv.Get("/playback/{id}", playbackH.Resolve)
 
 			priv.Route("/me/library", libraryH.Routes)
 			priv.Route("/uploads", uploadH.Routes)
+			priv.Route("/images", imageH.Routes)
+			priv.Route("/admin", adminH.Routes)
+			artistH.Routes(priv)
+			releaseH.Routes(priv)
 
 			// Adding a show makes the server fetch a user-supplied URL, so it is rate limited.
 			podcastH.Routes(priv, ratelimit.Middleware(d.Redis, "show-add", 30, time.Hour))

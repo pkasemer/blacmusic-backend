@@ -31,12 +31,15 @@ type kind struct {
 	table  string // library_*
 	col    string // entity id column
 	entity string // entity table
+	// visible is a SQL condition (on the entity table, aliased e) that a new
+	// library entry must satisfy, so drafts cannot be saved.
+	visible string
 }
 
 var (
-	tracks  = kind{"tracks", "library_tracks", "track_id", "tracks"}
-	albums  = kind{"albums", "library_albums", "album_id", "albums"}
-	artists = kind{"artists", "library_artists", "artist_id", "artists"}
+	tracks  = kind{"tracks", "library_tracks", "track_id", "tracks", "e.visibility = 'public'"}
+	albums  = kind{"albums", "library_albums", "album_id", "albums", "e.visibility = 'public'"}
+	artists = kind{"artists", "library_artists", "artist_id", "artists", "true"}
 )
 
 const maxContainsIDs = 100
@@ -55,13 +58,27 @@ func (h *Handler) Routes(r chi.Router) {
 }
 
 func (h *Handler) add(k kind) http.HandlerFunc {
+	exists := "SELECT EXISTS (SELECT 1 FROM " + k.entity + " e WHERE e.id = $1 AND " + k.visible + ")"
 	q := "INSERT INTO " + k.table + " (user_id, " + k.col + ") VALUES ($1, $2) ON CONFLICT DO NOTHING"
 	return func(w http.ResponseWriter, r *http.Request) {
 		uid, _ := auth.UserID(r.Context())
-		_, err := h.pool.Exec(r.Context(), q, uid, chi.URLParam(r, "id"))
+		id := chi.URLParam(r, "id")
+		notFound := func() {
+			httpx.Error(w, http.StatusNotFound, "not_found", strings.TrimSuffix(k.name, "s")+" not found")
+		}
+		var ok bool
+		if err := h.pool.QueryRow(r.Context(), exists, id).Scan(&ok); err != nil {
+			serverError(w, err)
+			return
+		}
+		if !ok {
+			notFound()
+			return
+		}
+		_, err := h.pool.Exec(r.Context(), q, uid, id)
 		var pgErr *pgconn.PgError
 		if errors.As(err, &pgErr) && pgErr.Code == "23503" {
-			httpx.Error(w, http.StatusNotFound, "not_found", strings.TrimSuffix(k.name, "s")+" not found")
+			notFound() // deleted between the check and the insert
 			return
 		}
 		if err != nil {
@@ -141,7 +158,7 @@ func (h *Handler) listTracks(w http.ResponseWriter, r *http.Request) {
 		JOIN tracks t        ON t.id  = l.track_id
 		LEFT JOIN artists a  ON a.id  = t.artist_id
 		LEFT JOIN albums  al ON al.id = t.album_id
-		WHERE l.user_id = $1
+		WHERE l.user_id = $1 AND t.visibility = 'public'
 		ORDER BY l.added_at DESC, t.id
 		LIMIT $2 OFFSET $3`, uid, limit, offset)
 	if err != nil {
@@ -181,7 +198,7 @@ func (h *Handler) listAlbums(w http.ResponseWriter, r *http.Request) {
 		FROM library_albums l
 		JOIN albums al      ON al.id = l.album_id
 		LEFT JOIN artists a ON a.id  = al.artist_id
-		WHERE l.user_id = $1
+		WHERE l.user_id = $1 AND al.visibility = 'public'
 		ORDER BY l.added_at DESC, al.id
 		LIMIT $2 OFFSET $3`, uid, limit, offset)
 	if err != nil {

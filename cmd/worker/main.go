@@ -8,10 +8,12 @@ import (
 	"os/signal"
 	"sync"
 	"syscall"
+	"time"
 
 	"github.com/blacmusic/backend/internal/config"
 	"github.com/blacmusic/backend/internal/db"
 	"github.com/blacmusic/backend/internal/podcast"
+	"github.com/blacmusic/backend/internal/release"
 	"github.com/blacmusic/backend/internal/storage"
 	"github.com/blacmusic/backend/internal/upload"
 	"github.com/blacmusic/backend/internal/worker"
@@ -50,7 +52,8 @@ func run() error {
 		return err
 	}
 
-	w := worker.New(upload.NewStore(pool), store, worker.Config{
+	uploads := upload.NewStore(pool)
+	w := worker.New(uploads, store, worker.Config{
 		FFmpeg:           cfg.FFmpegPath,
 		FFprobe:          cfg.FFprobePath,
 		MaxBytes:         cfg.UploadMaxBytes,
@@ -64,7 +67,10 @@ func run() error {
 
 	slog.Info("worker started", "concurrency", cfg.WorkerConcurrency)
 	var wg sync.WaitGroup
-	wg.Add(2)
+	// Pending uploads are abandoned once their presigned URL (plus a margin) has expired.
+	maint := worker.NewMaintenance(pool, uploads, release.NewStore(pool, store, cfg.PublicAPIURL), store, cfg.UploadURLTTL+30*time.Minute)
+	wg.Add(3)
+	go func() { defer wg.Done(); maint.Run(ctx) }()
 	go func() { defer wg.Done(); w.Run(ctx) }()
 	go func() { defer wg.Done(); refresher.Run(ctx) }()
 	wg.Wait()

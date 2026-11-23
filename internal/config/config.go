@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"os"
 	"strconv"
+	"strings"
 	"time"
 )
 
@@ -44,6 +45,15 @@ type Config struct {
 	FFmpegPath         string
 	FFprobePath        string
 
+	// Public identity and mail (API only).
+	PublicAPIURL     string // base URL clients reach the API at; used in image links
+	FreeStorageBytes int64  // free storage every artist starts with
+	SMTPHost         string // empty = log emails instead of sending (development only)
+	SMTPPort         string
+	SMTPUser         string
+	SMTPPassword     string
+	SMTPFrom         string
+
 	// Podcast feeds.
 	FeedAllowPrivate    bool          // dev only: let feed fetches reach private addresses
 	FeedRefreshInterval time.Duration // how often subscribed shows are re-fetched
@@ -72,6 +82,13 @@ func load(needJWT bool) (Config, error) {
 
 		FFmpegPath:  get("FFMPEG_PATH", "ffmpeg"),
 		FFprobePath: get("FFPROBE_PATH", "ffprobe"),
+
+		PublicAPIURL: strings.TrimRight(get("PUBLIC_API_URL", "http://localhost:8080"), "/"),
+		SMTPHost:     os.Getenv("SMTP_HOST"),
+		SMTPPort:     get("SMTP_PORT", "587"),
+		SMTPUser:     os.Getenv("SMTP_USER"),
+		SMTPPassword: os.Getenv("SMTP_PASSWORD"),
+		SMTPFrom:     get("SMTP_FROM", "Blac Music <no-reply@localhost>"),
 	}
 	c.S3PublicEndpoint = get("S3_PUBLIC_ENDPOINT", c.S3Endpoint)
 
@@ -99,7 +116,16 @@ func load(needJWT bool) (Config, error) {
 	}
 	c.AuthRateLimit = rate
 
-	maxMiB, err := getInt("UPLOAD_MAX_MB", 500)
+	freeGB, err := getInt("FREE_STORAGE_GB", 10)
+	if err != nil {
+		return c, err
+	}
+	if freeGB < 0 {
+		return c, fmt.Errorf("FREE_STORAGE_GB must not be negative")
+	}
+	c.FreeStorageBytes = int64(freeGB) << 30
+
+	maxMiB, err := getInt("UPLOAD_MAX_MB", 2048)
 	if err != nil {
 		return c, err
 	}
@@ -147,6 +173,9 @@ func load(needJWT bool) (Config, error) {
 	}
 	if c.JWTSecret == "" && c.Env == "development" {
 		c.JWTSecret = devJWTSecret
+	}
+	if c.Env == "production" && c.SMTPHost == "" {
+		return c, fmt.Errorf("SMTP_HOST must be set in production (verification emails cannot be sent otherwise)")
 	}
 	if len(c.JWTSecret) < 32 {
 		return c, fmt.Errorf("JWT_SECRET must be set and at least 32 characters")

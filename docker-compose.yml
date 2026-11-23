@@ -55,6 +55,9 @@ services:
       S3_SECRET_KEY: blacminio-secret
       S3_BUCKET: blac-media
       FEED_ALLOW_PRIVATE: "true"           # dev only: lets feeds be served from this machine/network
+      PUBLIC_API_URL: http://localhost:8080   # base URL clients use; Android emulator: http://10.0.2.2:8080
+      # No SMTP_HOST in development: verification codes are written to the API log
+      # (docker compose logs api). Set SMTP_HOST/SMTP_PORT/SMTP_USER/SMTP_PASSWORD/SMTP_FROM to send real email.
     ports: ["8080:8080"]
 
   # Turns uploaded originals into the low / medium / high AAC renditions.
@@ -71,6 +74,7 @@ services:
       S3_SECRET_KEY: blacminio-secret
       S3_BUCKET: blac-media
       WORKER_CONCURRENCY: "2"
+      PUBLIC_API_URL: http://localhost:8080
       FEED_ALLOW_PRIVATE: "true"           # dev only
 
 volumes:

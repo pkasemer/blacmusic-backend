@@ -12,6 +12,7 @@ import (
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
 
+	"github.com/blacmusic/backend/internal/auth"
 	"github.com/blacmusic/backend/internal/httpx"
 	"github.com/blacmusic/backend/internal/source"
 )
@@ -67,15 +68,17 @@ func (h *Handler) Search(w http.ResponseWriter, r *http.Request) {
 // GetTrack returns a canonical track by Blac Music id.
 func (h *Handler) GetTrack(w http.ResponseWriter, r *http.Request) {
 	id := chi.URLParam(r, "id")
+	uid, _ := auth.UserID(r.Context())
 	var t source.Track
+	// Drafts are visible to the artist who owns them, and to nobody else.
 	err := h.pool.QueryRow(r.Context(), `
-		SELECT t.id, t.title, COALESCE(a.name, ''), COALESCE(al.title, ''),
+		SELECT t.id, t.title, COALESCE(t.artist_id, ''), COALESCE(a.name, ''), COALESCE(t.album_id, ''), COALESCE(al.title, ''),
 		       t.duration_ms, COALESCE(t.artwork_url, al.artwork_url, '')
 		FROM tracks t
 		LEFT JOIN artists a  ON a.id  = t.artist_id
 		LEFT JOIN albums  al ON al.id = t.album_id
-		WHERE t.id = $1`, id).
-		Scan(&t.ID, &t.Title, &t.ArtistName, &t.AlbumTitle, &t.DurationMs, &t.ArtworkURL)
+		WHERE t.id = $1 AND (t.visibility = 'public' OR a.owner_user_id::text = $2)`, id, uid).
+		Scan(&t.ID, &t.Title, &t.ArtistID, &t.ArtistName, &t.AlbumID, &t.AlbumTitle, &t.DurationMs, &t.ArtworkURL)
 	if errors.Is(err, pgx.ErrNoRows) {
 		httpx.Error(w, http.StatusNotFound, "not_found", "track not found")
 		return

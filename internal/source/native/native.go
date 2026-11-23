@@ -42,7 +42,7 @@ func (p *Provider) Capabilities() []source.Capability {
 }
 
 const trackSelect = `
-	SELECT t.id, t.title, COALESCE(a.name, ''), COALESCE(al.title, ''),
+	SELECT t.id, t.title, COALESCE(t.artist_id, ''), COALESCE(a.name, ''), COALESCE(t.album_id, ''), COALESCE(al.title, ''),
 	       t.duration_ms, COALESCE(t.artwork_url, al.artwork_url, '')
 	FROM tracks t
 	LEFT JOIN artists a  ON a.id  = t.artist_id
@@ -51,7 +51,8 @@ const trackSelect = `
 func (p *Provider) Search(ctx context.Context, query string, limit, offset int) ([]source.Track, error) {
 	pattern := "%" + escapeLike(query) + "%"
 	rows, err := p.pool.Query(ctx, trackSelect+`
-		WHERE EXISTS (SELECT 1 FROM track_sources ts WHERE ts.track_id = t.id AND ts.source = 'native')
+		WHERE t.visibility = 'public'
+		  AND EXISTS (SELECT 1 FROM track_sources ts WHERE ts.track_id = t.id AND ts.source = 'native')
 		  AND (t.title ILIKE $1 OR a.name ILIKE $1)
 		ORDER BY t.title
 		LIMIT $2 OFFSET $3`, pattern, limit, offset)
@@ -63,7 +64,7 @@ func (p *Provider) Search(ctx context.Context, query string, limit, offset int) 
 	tracks := []source.Track{}
 	for rows.Next() {
 		var t source.Track
-		if err := rows.Scan(&t.ID, &t.Title, &t.ArtistName, &t.AlbumTitle, &t.DurationMs, &t.ArtworkURL); err != nil {
+		if err := rows.Scan(&t.ID, &t.Title, &t.ArtistID, &t.ArtistName, &t.AlbumID, &t.AlbumTitle, &t.DurationMs, &t.ArtworkURL); err != nil {
 			return nil, err
 		}
 		t.Source, t.SourceID = Name, t.ID
@@ -75,7 +76,7 @@ func (p *Provider) Search(ctx context.Context, query string, limit, offset int) 
 func (p *Provider) GetTrack(ctx context.Context, sourceID string) (*source.Track, error) {
 	var t source.Track
 	err := p.pool.QueryRow(ctx, trackSelect+` WHERE t.id = $1`, sourceID).
-		Scan(&t.ID, &t.Title, &t.ArtistName, &t.AlbumTitle, &t.DurationMs, &t.ArtworkURL)
+		Scan(&t.ID, &t.Title, &t.ArtistID, &t.ArtistName, &t.AlbumID, &t.AlbumTitle, &t.DurationMs, &t.ArtworkURL)
 	if errors.Is(err, pgx.ErrNoRows) {
 		return nil, source.ErrNotFound
 	}

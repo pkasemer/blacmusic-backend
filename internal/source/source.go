@@ -75,7 +75,9 @@ type PlaybackDescriptor struct {
 type Track struct {
 	ID         string `json:"id,omitempty"` // Blac Music id (trk_...), when known
 	Title      string `json:"title"`
+	ArtistID   string `json:"artistId,omitempty"`
 	ArtistName string `json:"artistName,omitempty"`
+	AlbumID    string `json:"albumId,omitempty"`
 	AlbumTitle string `json:"albumTitle,omitempty"`
 	DurationMs int    `json:"durationMs"`
 	ArtworkURL string `json:"artworkUrl,omitempty"`
