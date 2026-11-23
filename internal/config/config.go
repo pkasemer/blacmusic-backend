@@ -43,6 +43,11 @@ type Config struct {
 	WorkerPollInterval time.Duration
 	FFmpegPath         string
 	FFprobePath        string
+
+	// Podcast feeds.
+	FeedAllowPrivate    bool          // dev only: let feed fetches reach private addresses
+	FeedRefreshInterval time.Duration // how often subscribed shows are re-fetched
+	FeedFetchTimeout    time.Duration
 }
 
 // Load reads the environment and validates it for the API.
@@ -119,6 +124,22 @@ func load(needJWT bool) (Config, error) {
 	}
 	if c.WorkerConcurrency < 1 || c.WorkerConcurrency > 16 {
 		return c, fmt.Errorf("WORKER_CONCURRENCY must be 1-16")
+	}
+
+	if c.FeedAllowPrivate, err = getBool("FEED_ALLOW_PRIVATE", false); err != nil {
+		return c, err
+	}
+	if c.FeedAllowPrivate && c.Env == "production" {
+		return c, fmt.Errorf("FEED_ALLOW_PRIVATE must not be enabled in production")
+	}
+	if c.FeedRefreshInterval, err = getDuration("FEED_REFRESH_INTERVAL", time.Hour); err != nil {
+		return c, err
+	}
+	if c.FeedRefreshInterval < time.Minute {
+		return c, fmt.Errorf("FEED_REFRESH_INTERVAL must be at least 1m")
+	}
+	if c.FeedFetchTimeout, err = getDuration("FEED_FETCH_TIMEOUT", 15*time.Second); err != nil {
+		return c, err
 	}
 
 	if !needJWT {

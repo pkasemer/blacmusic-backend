@@ -74,7 +74,7 @@ GET  /v1/home                                    (personalised feed)
 WS   /v1/ws                                      (sync, listen-together)
 ```
 
-IDs are Blac Music IDs (`trk_...`, `epi_...`); each maps to one or more `(source, sourceId)` rows so the same song can fall back between sources.
+IDs are Blac Music IDs (`trk_...`, `epi_...` for podcast episodes, `shw_...` for shows); each maps to one or more `(source, sourceId)` rows so the same song can fall back between sources.
 
 ## 6. Data model (core tables)
 

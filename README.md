@@ -61,6 +61,28 @@ Flow (details in the shared notes, `backend-api-uploads-quality.md`):
 
 5. `GET /v1/playback/{trackId}?quality=low|medium|high` returns a presigned URL for that rendition (default medium) plus the list of available qualities with sizes. Originals are kept privately under `originals/` and never served.
 
+## Podcasts
+
+Podcasts come from public RSS feeds. The audio stays on the publisher's server; the API stores show and episode
+metadata and hands the app the publisher's URL at playback time. Full contract: `backend-api-podcasts.md` in the notes folder.
+
+```
+POST /v1/shows {feedUrl}                         add a feed by URL (also subscribes you; 201 new, 200 known)
+GET  /v1/shows/search?q=   /v1/shows/{id}   /v1/shows/{id}/episodes?order=newest|oldest&limit=&offset=
+GET  /v1/episodes/{id}     PUT /v1/episodes/{id}/progress {positionMs, durationMs?, completed?}
+GET  /v1/me/shows          PUT|DELETE /v1/me/shows/{id}      GET /v1/me/episodes/in-progress
+GET  /v1/playback/{epi_...}                      -> the enclosure URL
+```
+
+The worker container also refreshes every followed show (default hourly, with conditional GET and exponential
+backoff on failure); shows nobody follows are left alone.
+
+Users choose feed URLs, so fetching is locked down: only http(s), no credentials in URLs, and the connection itself
+refuses loopback, private, link-local (cloud metadata) and other internal addresses, including after redirects and
+DNS changes; 10 MB and 15 s limits; feed text is reduced to plain text. `FEED_ALLOW_PRIVATE=true` switches the address
+guard off for local development (docker-compose sets it so feeds can be served from your machine); the API refuses to
+start with it in production.
+
 ## Layout
 
 ```
@@ -76,7 +98,9 @@ internal/storage/     S3 client, presigned GET/PUT, stat, download, upload
 internal/media/       quality ladder, ffprobe validation, ffmpeg transcoding
 internal/upload/      upload API (creator role) and the processing queue in Postgres
 internal/worker/      claims queued uploads and runs probe -> transcode -> store -> create track
-cmd/worker/           the transcoding worker (the only image with ffmpeg)
+internal/podcast/     RSS parsing, SSRF-safe fetching, shows/episodes/subscriptions/progress, background refresher
+internal/source/podcast/  playback provider for episodes
+cmd/worker/           the transcoding worker and feed refresher (the only image with ffmpeg)
 internal/ratelimit/   Redis fixed-window limiter (auth endpoints)
 ```
 
@@ -90,8 +114,8 @@ Implement `source.Provider`, register it in `cmd/api/main.go`, and add `track_so
 Auth (register, login, refresh, logout, me), search, track lookup, playback resolve, readiness checks,
 playlists (CRUD, ordered items, add/remove/move, private or public), library (liked tracks, saved albums,
 followed artists, bulk `contains` check), creator uploads with low/medium/high transcoding and
-quality-aware playback.
-Not yet: podcasts, listen-together, admin UI, album/artist detail endpoints, cover art, upload cleanup of abandoned files.
+quality-aware playback, podcasts (RSS ingest, subscriptions, resume progress, background refresh).
+Not yet: podcast discovery directory, new-episode notifications, listen-together, admin UI, album/artist detail endpoints, cover art, upload cleanup of abandoned files.
 
 ## Tests
 

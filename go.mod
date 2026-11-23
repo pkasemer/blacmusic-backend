@@ -9,6 +9,7 @@ require (
 	github.com/minio/minio-go/v7 v7.0.80
 	github.com/redis/go-redis/v9 v9.7.0
 	golang.org/x/crypto v0.28.0
+	golang.org/x/net v0.30.0
 )
 
 require (
@@ -25,7 +26,6 @@ require (
 	github.com/klauspost/cpuid/v2 v2.2.8 // indirect
 	github.com/minio/md5-simd v1.1.2 // indirect
 	github.com/rs/xid v1.6.0 // indirect
-	golang.org/x/net v0.30.0 // indirect
 	golang.org/x/sync v0.8.0 // indirect
 	golang.org/x/sys v0.26.0 // indirect
 	golang.org/x/text v0.19.0 // indirect

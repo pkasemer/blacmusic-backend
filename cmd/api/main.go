@@ -18,6 +18,7 @@ import (
 	"github.com/blacmusic/backend/internal/server"
 	"github.com/blacmusic/backend/internal/source"
 	"github.com/blacmusic/backend/internal/source/native"
+	podcastsrc "github.com/blacmusic/backend/internal/source/podcast"
 	"github.com/blacmusic/backend/internal/storage"
 )
 
@@ -69,6 +70,7 @@ func run() error {
 	// client-resolved youtube reference provider...) are added here.
 	reg := source.NewRegistry()
 	reg.Register(native.New(pool, store, cfg.PlaybackURLTTL))
+	reg.Register(podcastsrc.New(pool))
 
 	srv := &http.Server{
 		Addr:              cfg.HTTPAddr,

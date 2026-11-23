@@ -18,6 +18,7 @@ import (
 	"github.com/blacmusic/backend/internal/library"
 	"github.com/blacmusic/backend/internal/playback"
 	"github.com/blacmusic/backend/internal/playlist"
+	"github.com/blacmusic/backend/internal/podcast"
 	"github.com/blacmusic/backend/internal/ratelimit"
 	"github.com/blacmusic/backend/internal/source"
 	"github.com/blacmusic/backend/internal/storage"
@@ -65,6 +66,8 @@ func Handler(d Deps) http.Handler {
 	playbackH := playback.NewHandler(d.Pool, d.Registry)
 	libraryH := library.NewHandler(d.Pool)
 	playlistH := playlist.NewHandler(playlist.NewStore(d.Pool))
+	podcastH := podcast.NewHandler(podcast.NewStore(d.Pool,
+		podcast.NewFetcher(d.Cfg.FeedAllowPrivate, d.Cfg.FeedFetchTimeout), d.Cfg.FeedRefreshInterval))
 	uploadH := upload.NewHandler(d.Pool, d.Store, d.Cfg.UploadMaxBytes, d.Cfg.UploadURLTTL)
 
 	r.Route("/v1", func(v1 chi.Router) {
@@ -85,6 +88,9 @@ func Handler(d Deps) http.Handler {
 
 			priv.Route("/me/library", libraryH.Routes)
 			priv.Route("/uploads", uploadH.Routes)
+
+			// Adding a show makes the server fetch a user-supplied URL, so it is rate limited.
+			podcastH.Routes(priv, ratelimit.Middleware(d.Redis, "show-add", 30, time.Hour))
 
 			priv.Get("/me/playlists", playlistH.ListMine)
 			priv.Post("/playlists", playlistH.Create)

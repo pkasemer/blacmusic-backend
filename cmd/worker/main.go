@@ -6,10 +6,12 @@ import (
 	"log/slog"
 	"os"
 	"os/signal"
+	"sync"
 	"syscall"
 
 	"github.com/blacmusic/backend/internal/config"
 	"github.com/blacmusic/backend/internal/db"
+	"github.com/blacmusic/backend/internal/podcast"
 	"github.com/blacmusic/backend/internal/storage"
 	"github.com/blacmusic/backend/internal/upload"
 	"github.com/blacmusic/backend/internal/worker"
@@ -57,8 +59,15 @@ func run() error {
 		PollInterval:     cfg.WorkerPollInterval,
 		Concurrency:      cfg.WorkerConcurrency,
 	})
+	refresher := podcast.NewRefresher(podcast.NewStore(pool,
+		podcast.NewFetcher(cfg.FeedAllowPrivate, cfg.FeedFetchTimeout), cfg.FeedRefreshInterval), 4)
+
 	slog.Info("worker started", "concurrency", cfg.WorkerConcurrency)
-	w.Run(ctx)
+	var wg sync.WaitGroup
+	wg.Add(2)
+	go func() { defer wg.Done(); w.Run(ctx) }()
+	go func() { defer wg.Done(); refresher.Run(ctx) }()
+	wg.Wait()
 	slog.Info("worker stopped")
 	return nil
 }

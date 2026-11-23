@@ -4,8 +4,10 @@ package playback
 
 import (
 	"context"
+	"errors"
 	"log/slog"
 	"net/http"
+	"strings"
 
 	"github.com/go-chi/chi/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
@@ -27,10 +29,14 @@ func NewHandler(pool *pgxpool.Pool, reg *source.Registry) *Handler {
 }
 
 type response struct {
-	TrackID  string                     `json:"trackId"`
-	Source   string                     `json:"source"`
-	Playback *source.PlaybackDescriptor `json:"playback"`
+	TrackID   string                     `json:"trackId,omitempty"`
+	EpisodeID string                     `json:"episodeId,omitempty"`
+	Source    string                     `json:"source"`
+	Playback  *source.PlaybackDescriptor `json:"playback"`
 }
+
+// episodePrefix marks podcast episode ids (epi_...); tracks are trk_...
+const episodePrefix = "epi_"
 
 type candidate struct{ source, sourceID string }
 
@@ -43,7 +49,14 @@ func (h *Handler) Resolve(w http.ResponseWriter, r *http.Request) {
 	}
 	opts := source.PlaybackOptions{Quality: string(quality)}
 
-	cands, err := h.candidates(r.Context(), trackID)
+	isEpisode := strings.HasPrefix(trackID, episodePrefix)
+	var cands []candidate
+	var err error
+	if isEpisode {
+		cands = []candidate{{source: "podcast", sourceID: trackID}} // episodes have exactly one source
+	} else {
+		cands, err = h.candidates(r.Context(), trackID)
+	}
 	if err != nil {
 		slog.Error("playback candidates", "err", err)
 		httpx.Error(w, http.StatusInternalServerError, "internal", "something went wrong")
@@ -61,10 +74,20 @@ func (h *Handler) Resolve(w http.ResponseWriter, r *http.Request) {
 		}
 		desc, err := p.ResolvePlayback(r.Context(), c.sourceID, opts)
 		if err != nil {
+			if isEpisode && errors.Is(err, source.ErrNotFound) {
+				httpx.Error(w, http.StatusNotFound, "not_found", "episode not found")
+				return
+			}
 			slog.Warn("resolve playback failed", "source", c.source, "track", trackID, "err", err)
 			continue // fall back to the next source
 		}
-		httpx.JSON(w, http.StatusOK, response{TrackID: trackID, Source: c.source, Playback: desc})
+		resp := response{Source: c.source, Playback: desc}
+		if isEpisode {
+			resp.EpisodeID = trackID
+		} else {
+			resp.TrackID = trackID
+		}
+		httpx.JSON(w, http.StatusOK, resp)
 		return
 	}
 	httpx.Error(w, http.StatusBadGateway, "no_playable_source", "no enabled source could play this track")
