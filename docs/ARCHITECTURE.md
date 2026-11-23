@@ -74,6 +74,10 @@ GET  /v1/home                                    (personalised feed)
 WS   /v1/ws                                      (sync, listen-together)
 ```
 
+Uploads over 16 MiB are S3 multipart uploads with presigned part URLs, so the audio never passes through the API and a
+transfer can resume after a dropped connection; the API inspects and assembles the parts itself. Loudness (EBU R128) is
+measured by the worker with ffmpeg and stored per track.
+
 Artist mode (see the README): every upload belongs to an artist profile and a release; originals count against a per-artist
 storage quota kept as a ledger of grants (`storage_grants`), transcoded copies do not. Content is `draft` until its release is
 published; only public tracks are searchable, playable by others, or savable. Scheduled releases are flipped by the worker.

@@ -23,6 +23,7 @@ type Blobs interface {
 	Download(ctx context.Context, key, dst string) error
 	UploadFile(ctx context.Context, key, src, contentType string) error
 	Remove(ctx context.Context, key string) error
+	AbortMultipart(ctx context.Context, key, uploadID string) error
 }
 
 // Config tunes the worker.
@@ -144,7 +145,7 @@ func (w *Worker) Process(ctx context.Context, u *upload.Upload) error {
 		return fmt.Errorf("stat original: %w", err)
 	}
 	// The presigned URL stays valid for a while after "complete", so re-check.
-	if size < 1 || (w.cfg.MaxBytes > 0 && size > w.cfg.MaxBytes) {
+	if size < 1 || (w.cfg.MaxBytes > 0 && size > w.cfg.MaxBytes) || size > u.SizeBytes {
 		return &media.InvalidMediaError{Msg: "the uploaded file has an unacceptable size"}
 	}
 
@@ -184,7 +185,17 @@ func (w *Worker) Process(ctx context.Context, u *upload.Upload) error {
 		return &media.InvalidMediaError{Msg: fmt.Sprintf("too long (the limit is %s)", w.cfg.MaxDuration.Round(time.Minute))}
 	}
 
-	res := upload.Result{DurationMs: int(outInfo.Duration.Milliseconds())}
+	// Loudness is measured on the original (before it was compressed). It is a
+	// convenience for the app, so a failure here never fails the upload.
+	lctx, lcancel := context.WithTimeout(ctx, w.cfg.TranscodeTimeout)
+	loud, lerr := media.MeasureLoudness(lctx, w.cfg.FFmpeg, in)
+	lcancel()
+	if lerr != nil {
+		slog.Warn("loudness not measured", "upload", u.ID, "err", lerr)
+		loud = nil
+	}
+
+	res := upload.Result{DurationMs: int(outInfo.Duration.Milliseconds()), Loudness: loud}
 	for _, o := range outs {
 		key := fmt.Sprintf("tracks/%s/%s.%s", u.TrackID, o.Quality, media.Container)
 		if err := w.blobs.UploadFile(ctx, key, o.Path, media.MimeType); err != nil {

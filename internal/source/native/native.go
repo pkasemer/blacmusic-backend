@@ -43,7 +43,7 @@ func (p *Provider) Capabilities() []source.Capability {
 
 const trackSelect = `
 	SELECT t.id, t.title, COALESCE(t.artist_id, ''), COALESCE(a.name, ''), COALESCE(t.album_id, ''), COALESCE(al.title, ''),
-	       t.duration_ms, COALESCE(t.artwork_url, al.artwork_url, '')
+	       t.duration_ms, COALESCE(t.artwork_url, al.artwork_url, ''), t.loudness_lufs, t.true_peak_db
 	FROM tracks t
 	LEFT JOIN artists a  ON a.id  = t.artist_id
 	LEFT JOIN albums  al ON al.id = t.album_id`
@@ -64,7 +64,7 @@ func (p *Provider) Search(ctx context.Context, query string, limit, offset int) 
 	tracks := []source.Track{}
 	for rows.Next() {
 		var t source.Track
-		if err := rows.Scan(&t.ID, &t.Title, &t.ArtistID, &t.ArtistName, &t.AlbumID, &t.AlbumTitle, &t.DurationMs, &t.ArtworkURL); err != nil {
+		if err := rows.Scan(&t.ID, &t.Title, &t.ArtistID, &t.ArtistName, &t.AlbumID, &t.AlbumTitle, &t.DurationMs, &t.ArtworkURL, &t.LoudnessLufs, &t.TruePeakDb); err != nil {
 			return nil, err
 		}
 		t.Source, t.SourceID = Name, t.ID
@@ -76,7 +76,7 @@ func (p *Provider) Search(ctx context.Context, query string, limit, offset int) 
 func (p *Provider) GetTrack(ctx context.Context, sourceID string) (*source.Track, error) {
 	var t source.Track
 	err := p.pool.QueryRow(ctx, trackSelect+` WHERE t.id = $1`, sourceID).
-		Scan(&t.ID, &t.Title, &t.ArtistID, &t.ArtistName, &t.AlbumID, &t.AlbumTitle, &t.DurationMs, &t.ArtworkURL)
+		Scan(&t.ID, &t.Title, &t.ArtistID, &t.ArtistName, &t.AlbumID, &t.AlbumTitle, &t.DurationMs, &t.ArtworkURL, &t.LoudnessLufs, &t.TruePeakDb)
 	if errors.Is(err, pgx.ErrNoRows) {
 		return nil, source.ErrNotFound
 	}
@@ -95,6 +95,9 @@ func (p *Provider) ResolvePlayback(ctx context.Context, sourceID string, opts so
 	if !ok {
 		want = media.Default
 	}
+
+	var lufs, peak *float64
+	_ = p.pool.QueryRow(ctx, `SELECT loudness_lufs, true_peak_db FROM tracks WHERE id = $1`, sourceID).Scan(&lufs, &peak)
 
 	rows, err := p.pool.Query(ctx, `
 		SELECT quality, media_key, codec, container, bitrate_kbps, size_bytes
@@ -137,11 +140,12 @@ func (p *Provider) ResolvePlayback(ctx context.Context, sourceID string, opts so
 		}
 		exp := time.Now().Add(p.ttl).UTC()
 		d := &source.PlaybackDescriptor{
-			Mode:      source.ModeURL,
-			URL:       url,
-			ExpiresAt: &exp,
-			Format:    &source.Format{Codec: r.codec, Container: r.container, BitrateKbps: r.kbps},
-			Quality:   string(chosen),
+			Mode:         source.ModeURL,
+			URL:          url,
+			ExpiresAt:    &exp,
+			Format:       &source.Format{Codec: r.codec, Container: r.container, BitrateKbps: r.kbps},
+			Quality:      string(chosen),
+			LoudnessLufs: lufs, TruePeakDb: peak,
 		}
 		for _, q := range avail {
 			o := have[q]
@@ -169,10 +173,11 @@ func (p *Provider) ResolvePlayback(ctx context.Context, sourceID string, opts so
 	}
 	exp := time.Now().Add(p.ttl).UTC()
 	return &source.PlaybackDescriptor{
-		Mode:      source.ModeURL,
-		URL:       url,
-		ExpiresAt: &exp,
-		Format:    &source.Format{Codec: codec, BitrateKbps: kbps},
+		Mode:         source.ModeURL,
+		URL:          url,
+		ExpiresAt:    &exp,
+		Format:       &source.Format{Codec: codec, BitrateKbps: kbps},
+		LoudnessLufs: lufs, TruePeakDb: peak,
 	}, nil
 }
 

@@ -16,6 +16,7 @@ import (
 	"github.com/jackc/pgx/v5/pgxpool"
 
 	"github.com/blacmusic/backend/internal/artist"
+	"github.com/blacmusic/backend/internal/media"
 )
 
 // Status is where an upload is in its life.
@@ -69,6 +70,8 @@ type Upload struct {
 	Filename    string
 	SizeBytes   int64
 	OriginalKey string
+	MultipartID string // open object-store upload id; empty for single-PUT uploads and once completed
+	PartSize    int64  // 0 for single-PUT uploads
 	Status      Status
 	Error       string
 	Attempts    int
@@ -83,13 +86,14 @@ type Store struct{ pool *pgxpool.Pool }
 func NewStore(pool *pgxpool.Pool) *Store { return &Store{pool: pool} }
 
 const cols = `id, user_id::text, COALESCE(artist_id, ''), COALESCE(release_id, ''), track_id, title, artist_name, album_title,
-	genre, track_number, explicit, filename, size_bytes, original_key, status, COALESCE(error, ''), attempts, created_at, updated_at`
+	genre, track_number, explicit, filename, size_bytes, original_key, multipart_id, part_size, status, COALESCE(error, ''),
+	attempts, created_at, updated_at`
 
 func scan(row pgx.Row) (*Upload, error) {
 	var u Upload
 	var st string
 	err := row.Scan(&u.ID, &u.UserID, &u.ArtistID, &u.ReleaseID, &u.TrackID, &u.Title, &u.ArtistName, &u.AlbumTitle,
-		&u.Genre, &u.TrackNumber, &u.Explicit, &u.Filename, &u.SizeBytes, &u.OriginalKey, &st, &u.Error, &u.Attempts,
+		&u.Genre, &u.TrackNumber, &u.Explicit, &u.Filename, &u.SizeBytes, &u.OriginalKey, &u.MultipartID, &u.PartSize, &st, &u.Error, &u.Attempts,
 		&u.CreatedAt, &u.UpdatedAt)
 	if errors.Is(err, pgx.ErrNoRows) {
 		return nil, ErrNotFound
@@ -109,6 +113,7 @@ type NewUpload struct {
 	Filename     string
 	SizeBytes    int64
 	TermsVersion string // the terms the artist confirmed they own the rights under
+	PartSize     int64  // > 0 makes this a resumable multipart upload with parts of this size
 }
 
 // Create reserves an upload for the user's artist profile. In one transaction,
@@ -174,11 +179,11 @@ func (s *Store) Create(ctx context.Context, n NewUpload) (*Upload, error) {
 	u, err := scan(tx.QueryRow(ctx, `
 		WITH ids AS (SELECT 'upl_' || replace(gen_random_uuid()::text, '-', '') AS id)
 		INSERT INTO uploads (id, user_id, artist_id, release_id, title, artist_name, album_title, genre, track_number,
-		                     explicit, filename, size_bytes, original_key, rights_terms_version, rights_accepted_at)
-		SELECT ids.id, $1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, 'originals/' || ids.id, $12, now() FROM ids
+		                     explicit, filename, size_bytes, original_key, rights_terms_version, rights_accepted_at, part_size)
+		SELECT ids.id, $1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, 'originals/' || ids.id, $12, now(), $13 FROM ids
 		RETURNING `+cols,
 		n.UserID, artistID, releaseID, n.Title, artistName, releaseTitle, n.Genre, n.TrackNumber, n.Explicit,
-		n.Filename, n.SizeBytes, n.TermsVersion))
+		n.Filename, n.SizeBytes, n.TermsVersion, n.PartSize))
 	if err != nil {
 		return nil, err
 	}
@@ -209,12 +214,20 @@ func (s *Store) ListByUser(ctx context.Context, userID string, limit, offset int
 	return out, rows.Err()
 }
 
-// Queue moves a pending upload to queued. Calling it again on an upload that
-// is already past pending is a no-op that returns the current state.
-func (s *Store) Queue(ctx context.Context, id string) (*Upload, error) {
+// SetMultipart records the object store's upload id for a multipart upload.
+func (s *Store) SetMultipart(ctx context.Context, id, uploadID string) error {
+	_, err := s.pool.Exec(ctx, `UPDATE uploads SET multipart_id = $2 WHERE id = $1 AND status = 'pending'`, id, uploadID)
+	return err
+}
+
+// Queue moves a pending upload to queued and records the size the file really
+// has (never more than was declared, so the reserved storage can only shrink).
+// Calling it again on an upload that is already past pending is a no-op that
+// returns the current state.
+func (s *Store) Queue(ctx context.Context, id string, actualSize int64) (*Upload, error) {
 	u, err := scan(s.pool.QueryRow(ctx, `
-		UPDATE uploads SET status = 'queued', updated_at = now()
-		WHERE id = $1 AND status = 'pending' RETURNING `+cols, id))
+		UPDATE uploads SET status = 'queued', size_bytes = LEAST(size_bytes, $2), multipart_id = '', updated_at = now()
+		WHERE id = $1 AND status = 'pending' RETURNING `+cols, id, actualSize))
 	if errors.Is(err, ErrNotFound) {
 		return s.Get(ctx, id)
 	}
@@ -230,48 +243,59 @@ func (s *Store) Fail(ctx context.Context, id, msg string) error {
 	return err
 }
 
+// Stale names stored data that must be deleted once its upload is gone: the
+// object, and any unfinished multipart upload (whose parts also use storage).
+type Stale struct {
+	Key         string
+	MultipartID string
+}
+
 // Delete removes an upload that has not become a track (pending or failed) and
-// returns its original's storage key. Finished uploads are removed by deleting
-// the track.
-func (s *Store) Delete(ctx context.Context, id, userID string) (string, error) {
-	var key string
+// returns what to delete from storage. Finished uploads are removed by
+// deleting the track.
+func (s *Store) Delete(ctx context.Context, id, userID string) (*Stale, error) {
+	var st Stale
 	err := s.pool.QueryRow(ctx, `
 		DELETE FROM uploads WHERE id = $1 AND user_id = $2 AND status IN ('pending','failed')
-		RETURNING original_key`, id, userID).Scan(&key)
+		RETURNING original_key, multipart_id`, id, userID).Scan(&st.Key, &st.MultipartID)
 	if errors.Is(err, pgx.ErrNoRows) {
 		var exists bool
 		if qerr := s.pool.QueryRow(ctx, `SELECT EXISTS (SELECT 1 FROM uploads WHERE id = $1 AND user_id = $2)`, id, userID).Scan(&exists); qerr != nil {
-			return "", qerr
+			return nil, qerr
 		}
 		if exists {
-			return "", ErrInUse
+			return nil, ErrInUse
 		}
-		return "", ErrNotFound
+		return nil, ErrNotFound
 	}
-	return key, err
+	if err != nil {
+		return nil, err
+	}
+	return &st, nil
 }
 
-// ExpirePending fails uploads whose file never arrived and returns their
-// storage keys so the caller can delete any partial object. This is what
-// returns reserved quota from abandoned uploads.
-func (s *Store) ExpirePending(ctx context.Context, olderThan time.Duration) ([]string, error) {
+// ExpirePending fails uploads whose file never arrived and returns what the
+// caller must delete from storage (a partial object, or the parts of an
+// unfinished multipart upload). This is what returns reserved quota from
+// abandoned uploads.
+func (s *Store) ExpirePending(ctx context.Context, olderThan time.Duration) ([]Stale, error) {
 	rows, err := s.pool.Query(ctx, `
 		UPDATE uploads SET status = 'failed', error = 'the upload was never completed', updated_at = now()
 		WHERE status = 'pending' AND created_at < now() - make_interval(secs => $1)
-		RETURNING original_key`, olderThan.Seconds())
+		RETURNING original_key, multipart_id`, olderThan.Seconds())
 	if err != nil {
 		return nil, err
 	}
 	defer rows.Close()
-	var keys []string
+	var out []Stale
 	for rows.Next() {
-		var k string
-		if err := rows.Scan(&k); err != nil {
+		var st Stale
+		if err := rows.Scan(&st.Key, &st.MultipartID); err != nil {
 			return nil, err
 		}
-		keys = append(keys, k)
+		out = append(out, st)
 	}
-	return keys, rows.Err()
+	return out, rows.Err()
 }
 
 // Claim hands the oldest queued upload to a worker, or returns (nil, nil) when
@@ -322,7 +346,8 @@ type Rendition struct {
 // Result is what a successful transcode produced.
 type Result struct {
 	DurationMs int
-	Renditions []Rendition // must include "medium"
+	Renditions []Rendition     // must include "medium"
+	Loudness   *media.Loudness // nil when it could not be measured (or the track is silent)
 }
 
 // ErrReleaseGone means the release the upload belonged to no longer exists.
@@ -366,10 +391,16 @@ func (s *Store) Finish(ctx context.Context, u *Upload, res Result) error {
 		trackVisibility = "public"
 	}
 
+	var lufs, peak, lra *float64
+	if res.Loudness != nil {
+		lufs, peak, lra = &res.Loudness.IntegratedLUFS, &res.Loudness.TruePeakDB, &res.Loudness.RangeLU
+	}
 	if _, err := tx.Exec(ctx, `
-		INSERT INTO tracks (id, title, artist_id, album_id, duration_ms, explicit, genre, track_number, visibility)
-		VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)`,
-		u.TrackID, u.Title, u.ArtistID, u.ReleaseID, res.DurationMs, u.Explicit, u.Genre, u.TrackNumber, trackVisibility); err != nil {
+		INSERT INTO tracks (id, title, artist_id, album_id, duration_ms, explicit, genre, track_number, visibility,
+		                    loudness_lufs, true_peak_db, loudness_range_lu, loudness_checked_at)
+		VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, now())`,
+		u.TrackID, u.Title, u.ArtistID, u.ReleaseID, res.DurationMs, u.Explicit, u.Genre, u.TrackNumber, trackVisibility,
+		lufs, peak, lra); err != nil {
 		return err
 	}
 	// Legacy single-file pointer: keeps the track visible to native search and

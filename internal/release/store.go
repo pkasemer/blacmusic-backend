@@ -31,6 +31,7 @@ func (e *ValidationError) Error() string { return e.Msg }
 // Blobs removes objects from storage.
 type Blobs interface {
 	Remove(ctx context.Context, key string) error
+	AbortMultipart(ctx context.Context, key, uploadID string) error
 }
 
 // Store owns releases and the tracks inside them.
@@ -54,13 +55,14 @@ type ArtistRef struct {
 
 // TrackView is a track inside a release.
 type TrackView struct {
-	ID          string `json:"id"`
-	Title       string `json:"title"`
-	TrackNumber *int   `json:"trackNumber,omitempty"`
-	DurationMs  int    `json:"durationMs"`
-	Explicit    bool   `json:"explicit"`
-	Genre       string `json:"genre,omitempty"`
-	Visibility  string `json:"visibility,omitempty"` // owner only
+	ID           string   `json:"id"`
+	Title        string   `json:"title"`
+	TrackNumber  *int     `json:"trackNumber,omitempty"`
+	DurationMs   int      `json:"durationMs"`
+	Explicit     bool     `json:"explicit"`
+	Genre        string   `json:"genre,omitempty"`
+	Visibility   string   `json:"visibility,omitempty"` // owner only
+	LoudnessLufs *float64 `json:"loudnessLufs,omitempty"`
 }
 
 // UploadView is a file still on its way to becoming a track (owner only).
@@ -133,7 +135,7 @@ func (s *Store) Get(ctx context.Context, id, viewer string) (*Release, error) {
 		return nil, ErrNotFound
 	}
 
-	q := `SELECT t.id, t.title, t.track_number, t.duration_ms, t.explicit, t.genre, t.visibility FROM tracks t
+	q := `SELECT t.id, t.title, t.track_number, t.duration_ms, t.explicit, t.genre, t.visibility, t.loudness_lufs FROM tracks t
 	      WHERE t.album_id = $1`
 	if !r.Mine {
 		q += ` AND t.visibility = 'public'`
@@ -144,7 +146,7 @@ func (s *Store) Get(ctx context.Context, id, viewer string) (*Release, error) {
 	}
 	for rows.Next() {
 		var t TrackView
-		if err := rows.Scan(&t.ID, &t.Title, &t.TrackNumber, &t.DurationMs, &t.Explicit, &t.Genre, &t.Visibility); err != nil {
+		if err := rows.Scan(&t.ID, &t.Title, &t.TrackNumber, &t.DurationMs, &t.Explicit, &t.Genre, &t.Visibility, &t.LoudnessLufs); err != nil {
 			rows.Close()
 			return nil, err
 		}
@@ -566,9 +568,9 @@ func (s *Store) UpdateTrack(ctx context.Context, id, userID string, p TrackPatch
 	}
 	err = s.pool.QueryRow(ctx, `
 		UPDATE tracks SET title=$2, explicit=$3, genre=$4, track_number=$5 WHERE id=$1
-		RETURNING id, title, track_number, duration_ms, explicit, genre, visibility`,
+		RETURNING id, title, track_number, duration_ms, explicit, genre, visibility, loudness_lufs`,
 		id, t.Title, t.Explicit, t.Genre, number).
-		Scan(&t.ID, &t.Title, &t.TrackNumber, &t.DurationMs, &t.Explicit, &t.Genre, &t.Visibility)
+		Scan(&t.ID, &t.Title, &t.TrackNumber, &t.DurationMs, &t.Explicit, &t.Genre, &t.Visibility, &t.LoudnessLufs)
 	if err != nil {
 		return nil, err
 	}
@@ -657,18 +659,23 @@ func (s *Store) Delete(ctx context.Context, id, userID string) error {
 	if err != nil {
 		return err
 	}
-	// Uploads that never became tracks (pending, queued, failed).
-	orows, err := tx.Query(ctx, `DELETE FROM uploads WHERE release_id = $1 RETURNING original_key`, id)
+	// Uploads that never became tracks (pending, queued, failed). An unfinished
+	// multipart upload must be aborted or its parts keep using storage.
+	orows, err := tx.Query(ctx, `DELETE FROM uploads WHERE release_id = $1 RETURNING original_key, multipart_id`, id)
 	if err != nil {
 		return err
 	}
+	var multiparts [][2]string
 	for orows.Next() {
-		var k string
-		if err := orows.Scan(&k); err != nil {
+		var k, mp string
+		if err := orows.Scan(&k, &mp); err != nil {
 			orows.Close()
 			return err
 		}
 		keys = append(keys, k)
+		if mp != "" {
+			multiparts = append(multiparts, [2]string{k, mp})
+		}
 	}
 	orows.Close()
 	if err := orows.Err(); err != nil {
@@ -679,6 +686,11 @@ func (s *Store) Delete(ctx context.Context, id, userID string) error {
 	}
 	if err := tx.Commit(ctx); err != nil {
 		return err
+	}
+	for _, m := range multiparts {
+		if err := s.blobs.AbortMultipart(ctx, m[0], m[1]); err != nil {
+			logRemoveFailure(m[0], err)
+		}
 	}
 	s.removeObjects(ctx, keys)
 	return nil

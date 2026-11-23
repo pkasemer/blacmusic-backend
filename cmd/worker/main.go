@@ -68,7 +68,7 @@ func run() error {
 	slog.Info("worker started", "concurrency", cfg.WorkerConcurrency)
 	var wg sync.WaitGroup
 	// Pending uploads are abandoned once their presigned URL (plus a margin) has expired.
-	maint := worker.NewMaintenance(pool, uploads, release.NewStore(pool, store, cfg.PublicAPIURL), store, cfg.UploadURLTTL+30*time.Minute)
+	maint := worker.NewMaintenance(pool, uploads, release.NewStore(pool, store, cfg.PublicAPIURL), store, cfg.UploadURLTTL+30*time.Minute, cfg.FFmpegPath)
 	wg.Add(3)
 	go func() { defer wg.Done(); maint.Run(ctx) }()
 	go func() { defer wg.Done(); w.Run(ctx) }()

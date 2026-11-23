@@ -68,7 +68,7 @@ func (e *env) submit(releaseID string, data []byte) *upload.Upload {
 		e.t.Fatal(err)
 	}
 	e.blobs.Put(u.OriginalKey, data)
-	if _, err := e.store.Queue(ctx, u.ID); err != nil {
+	if _, err := e.store.Queue(ctx, u.ID, u.SizeBytes); err != nil {
 		e.t.Fatal(err)
 	}
 	// Claim the oldest queued job; on a shared DB it may belong to someone
@@ -162,6 +162,17 @@ func TestProcessProducesLowMediumHigh(t *testing.T) {
 	}
 	if st, _ := e.store.Get(ctx, job.ID); st.Status != upload.StatusReady {
 		t.Fatalf("status = %s, want ready", st.Status)
+	}
+
+	// Loudness was measured on the original and stored.
+	var lufs, peak *float64
+	var checked *time.Time
+	if err := e.pool.QueryRow(ctx, `SELECT loudness_lufs, true_peak_db, loudness_checked_at FROM tracks WHERE id=$1`, job.TrackID).
+		Scan(&lufs, &peak, &checked); err != nil {
+		t.Fatal(err)
+	}
+	if lufs == nil || *lufs > -5 || *lufs < -45 || peak == nil || *peak > 3 || checked == nil {
+		t.Fatalf("loudness = %v / peak %v / checked %v, want plausible values for 0.3-amplitude pink noise", lufs, peak, checked)
 	}
 
 	// The legacy pointer exists (native search needs it) and targets the medium file.
@@ -374,7 +385,7 @@ func TestMaintenanceGoesLiveAndExpires(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	NewMaintenance(e.pool, e.store, rs, e.blobs, time.Hour).RunOnce(ctx)
+	NewMaintenance(e.pool, e.store, rs, e.blobs, time.Hour, "ffmpeg").RunOnce(ctx)
 
 	var vis, tvis string
 	if err := e.pool.QueryRow(ctx, `SELECT al.visibility, t.visibility FROM albums al JOIN tracks t ON t.album_id=al.id WHERE al.id=$1`, rel).Scan(&vis, &tvis); err != nil {
@@ -392,3 +403,88 @@ func TestMaintenanceGoesLiveAndExpires(t *testing.T) {
 }
 
 func ptrTime(t time.Time) *time.Time { return &t }
+
+func TestBackfillMeasuresOldTracksFromTheirHighRendition(t *testing.T) {
+	e := setup(t)
+	ctx := context.Background()
+	rs := release.NewStore(e.pool, e.blobs, "http://api.test")
+	rel := testutil.Release(t, e.pool, e.artistID, "Old Album", "album", "public")
+
+	// An old track whose rendition exists, one whose file is gone.
+	withFile, _ := testutil.ReadyTrack(t, e.pool, e.uid, e.artistID, rel, "Has file", 100, "public")
+	noFile, _ := testutil.ReadyTrack(t, e.pool, e.uid, e.artistID, rel, "No file", 100, "public")
+	dir := t.TempDir()
+	m4a := filepath.Join(dir, "high.m4a")
+	if out, err := exec.Command("ffmpeg", "-nostdin", "-loglevel", "error", "-y", "-f", "lavfi", "-i", "sine=f=1000:d=4",
+		"-ac", "2", "-c:a", "aac", "-b:a", "256k", m4a).CombinedOutput(); err != nil {
+		t.Fatalf("make rendition: %v\n%s", err, out)
+	}
+	data, _ := os.ReadFile(m4a)
+	e.blobs.Put("tracks/"+withFile+"/high.m4a", data)
+
+	maint := NewMaintenance(e.pool, e.store, rs, e.blobs, time.Hour, "ffmpeg")
+	state := func(id string) (lufs *float64, checked *time.Time) {
+		if err := e.pool.QueryRow(ctx, `SELECT loudness_lufs, loudness_checked_at FROM tracks WHERE id=$1`, id).Scan(&lufs, &checked); err != nil {
+			t.Fatal(err)
+		}
+		return
+	}
+	for i := 0; i < 30; i++ { // a few tracks are measured per run; other tests' tracks may be ahead of ours
+		maint.RunOnce(ctx)
+		if _, c1 := state(withFile); c1 != nil {
+			if _, c2 := state(noFile); c2 != nil {
+				break
+			}
+		}
+	}
+	lufs, checked := state(withFile)
+	if lufs == nil || *lufs < -22.5 || *lufs > -19.5 || checked == nil {
+		t.Fatalf("measured track: %v / %v, want about -21 LUFS and a check time", lufs, checked)
+	}
+	lufs, checked = state(noFile)
+	if lufs != nil || checked == nil {
+		t.Fatalf("a track with no file must be marked checked (not retried forever) and stay unknown: %v / %v", lufs, checked)
+	}
+}
+
+func TestExpiredMultipartUploadsAreAborted(t *testing.T) {
+	e := setup(t)
+	ctx := context.Background()
+	u, err := e.store.Create(ctx, upload.NewUpload{
+		UserID: e.uid, Title: "Big", Filename: "big.wav", SizeBytes: 30_000_000, TermsVersion: "v", PartSize: 8 << 20,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	mp, err := e.blobs.StartMultipart(ctx, u.OriginalKey)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := e.store.SetMultipart(ctx, u.ID, mp); err != nil {
+		t.Fatal(err)
+	}
+	e.blobs.PutPart(mp, 1, make([]byte, 100))
+	if _, err := e.pool.Exec(ctx, `UPDATE uploads SET created_at = now() - interval '5 hours' WHERE id=$1`, u.ID); err != nil {
+		t.Fatal(err)
+	}
+
+	rs := release.NewStore(e.pool, e.blobs, "http://api.test")
+	NewMaintenance(e.pool, e.store, rs, e.blobs, time.Hour, "ffmpeg").RunOnce(ctx)
+
+	if e.blobs.OpenUploads() != 0 {
+		t.Fatalf("an abandoned multipart upload must be aborted, %d still open", e.blobs.OpenUploads())
+	}
+	if st, _ := e.store.Get(ctx, u.ID); st.Status != upload.StatusFailed {
+		t.Fatalf("status = %s, want failed", st.Status)
+	}
+}
+
+func TestProcessRefusesAFileBiggerThanDeclared(t *testing.T) {
+	e := setup(t)
+	job := e.submit("", tone(t, 2, 2))
+	e.blobs.Put(job.OriginalKey, append(tone(t, 2, 2), make([]byte, 5000)...)) // swapped for a bigger file after queueing
+	var inv *media.InvalidMediaError
+	if err := e.w.Process(context.Background(), job); !errors.As(err, &inv) {
+		t.Fatalf("err = %v, want InvalidMediaError", err)
+	}
+}

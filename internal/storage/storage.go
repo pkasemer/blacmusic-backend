@@ -6,6 +6,9 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"net/http"
+	"net/url"
+	"strconv"
 	"time"
 
 	"github.com/minio/minio-go/v7"
@@ -131,4 +134,73 @@ func (s *Store) Open(ctx context.Context, key string) (io.ReadCloser, int64, err
 		return nil, 0, mapErr(err)
 	}
 	return obj, st.Size, nil
+}
+
+// Part is one uploaded part of a multipart upload.
+type Part struct {
+	Number int
+	Size   int64
+	ETag   string
+}
+
+// StartMultipart opens a multipart upload for key and returns its upload id.
+func (s *Store) StartMultipart(ctx context.Context, key string) (string, error) {
+	core := minio.Core{Client: s.internal}
+	return core.NewMultipartUpload(ctx, s.bucket, key, minio.PutObjectOptions{ContentType: "application/octet-stream"})
+}
+
+// PresignPart returns a time-limited URL the client PUTs one part to.
+func (s *Store) PresignPart(ctx context.Context, key, uploadID string, number int, ttl time.Duration) (string, error) {
+	q := url.Values{"uploadId": {uploadID}, "partNumber": {strconv.Itoa(number)}}
+	u, err := s.public.Presign(ctx, http.MethodPut, s.bucket, key, ttl, q)
+	if err != nil {
+		return "", err
+	}
+	return u.String(), nil
+}
+
+// ListParts returns the parts uploaded so far, or ErrNotFound when the upload
+// id is unknown (never started, aborted, or already completed).
+func (s *Store) ListParts(ctx context.Context, key, uploadID string) ([]Part, error) {
+	core := minio.Core{Client: s.internal}
+	var parts []Part
+	marker := 0
+	for {
+		res, err := core.ListObjectParts(ctx, s.bucket, key, uploadID, marker, 1000)
+		if err != nil {
+			if minio.ToErrorResponse(err).Code == "NoSuchUpload" {
+				return nil, ErrNotFound
+			}
+			return nil, err
+		}
+		for _, p := range res.ObjectParts {
+			parts = append(parts, Part{Number: p.PartNumber, Size: p.Size, ETag: p.ETag})
+		}
+		if !res.IsTruncated {
+			return parts, nil
+		}
+		marker = res.NextPartNumberMarker
+	}
+}
+
+// CompleteMultipart assembles the parts, in the order given, into the object.
+func (s *Store) CompleteMultipart(ctx context.Context, key, uploadID string, parts []Part) error {
+	core := minio.Core{Client: s.internal}
+	cp := make([]minio.CompletePart, len(parts))
+	for i, p := range parts {
+		cp[i] = minio.CompletePart{PartNumber: p.Number, ETag: p.ETag}
+	}
+	_, err := core.CompleteMultipartUpload(ctx, s.bucket, key, uploadID, cp, minio.PutObjectOptions{})
+	return err
+}
+
+// AbortMultipart discards an unfinished multipart upload and its stored parts.
+// Aborting an unknown upload is not an error.
+func (s *Store) AbortMultipart(ctx context.Context, key, uploadID string) error {
+	core := minio.Core{Client: s.internal}
+	err := core.AbortMultipartUpload(ctx, s.bucket, key, uploadID)
+	if err != nil && minio.ToErrorResponse(err).Code == "NoSuchUpload" {
+		return nil
+	}
+	return err
 }

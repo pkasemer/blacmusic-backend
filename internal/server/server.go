@@ -75,7 +75,9 @@ func Handler(d Deps) http.Handler {
 	playlistH := playlist.NewHandler(playlist.NewStore(d.Pool))
 	podcastH := podcast.NewHandler(podcast.NewStore(d.Pool,
 		podcast.NewFetcher(d.Cfg.FeedAllowPrivate, d.Cfg.FeedFetchTimeout), d.Cfg.FeedRefreshInterval))
-	uploadH := upload.NewHandler(upload.NewStore(d.Pool), d.Store, d.Cfg.UploadMaxBytes, d.Cfg.UploadURLTTL)
+	uploadH := upload.NewHandler(upload.NewStore(d.Pool), d.Store, upload.Options{
+		MaxBytes: d.Cfg.UploadMaxBytes, URLTTL: d.Cfg.UploadURLTTL, PartSize: d.Cfg.UploadPartBytes,
+	})
 	artistStore := artist.NewStore(d.Pool, d.Cfg.FreeStorageBytes, d.Cfg.PublicAPIURL)
 	artistH := artist.NewHandler(artistStore)
 	releaseH := release.NewHandler(release.NewStore(d.Pool, d.Store, d.Cfg.PublicAPIURL))
@@ -101,6 +103,7 @@ func Handler(d Deps) http.Handler {
 			priv.Post("/auth/email/send-code", authH.SendEmailCode)
 			priv.Post("/auth/email/verify", authH.VerifyEmail)
 			priv.Get("/search", catalogH.Search)
+			priv.Get("/browse/tracks", catalogH.Browse)
 			priv.Get("/tracks/{id}", catalogH.GetTrack)
 			priv.Get("/playback/{id}", playbackH.Resolve)
 

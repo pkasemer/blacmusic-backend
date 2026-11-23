@@ -37,6 +37,7 @@ type Config struct {
 
 	// Uploads and the transcoding worker.
 	UploadMaxBytes     int64         // largest accepted original
+	UploadPartBytes    int64         // size of each part of a resumable upload
 	UploadURLTTL       time.Duration // how long a presigned upload URL stays valid
 	MaxTrackDuration   time.Duration // longest accepted track or episode
 	TranscodeTimeout   time.Duration // wall-clock limit for one ffmpeg run
@@ -133,6 +134,15 @@ func load(needJWT bool) (Config, error) {
 		return c, fmt.Errorf("UPLOAD_MAX_MB must be at least 1")
 	}
 	c.UploadMaxBytes = int64(maxMiB) << 20
+	partMiB, err := getInt("UPLOAD_PART_MB", 8)
+	if err != nil {
+		return c, err
+	}
+	// Object stores require every part but the last to be at least 5 MiB.
+	if partMiB < 5 || partMiB > 512 {
+		return c, fmt.Errorf("UPLOAD_PART_MB must be between 5 and 512")
+	}
+	c.UploadPartBytes = int64(partMiB) << 20
 	if c.UploadURLTTL, err = getDuration("UPLOAD_URL_TTL", time.Hour); err != nil {
 		return c, err
 	}

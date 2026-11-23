@@ -48,10 +48,14 @@ then upload. Full contract: `backend-api-artist-mode.md` in the notes folder.
 2. `POST /v1/artists`, then optionally an avatar and a cover (`POST /v1/images`, PUT the file, `.../complete`; images are
    validated and re-encoded, EXIF dropped, served publicly from `/v1/media/...`).
 3. `POST /v1/releases` (single or album, starts as a **draft**).
-4. `POST /v1/uploads` (confirm you own the rights) returns a presigned **PUT** URL; the file goes straight to object
-   storage; `POST /v1/uploads/{id}/complete` queues it. Quota is reserved up front (402 `quota_exceeded` when it does not fit).
-5. The `worker` container probes the file and transcodes it once into three AAC-LC `.m4a` renditions, then creates the
-   track inside the release:
+4. `POST /v1/uploads` (confirm you own the rights) returns where to send the file. Files up to 16 MiB are one presigned
+   **PUT**; larger ones are a **resumable multipart upload**: 8 MiB parts, each with its own presigned URL, sent in any
+   order and in parallel. After a dropped connection `GET /v1/uploads/{id}/parts` lists what arrived and gives fresh URLs
+   for the rest. `POST /v1/uploads/{id}/complete` checks the parts itself, assembles them (409 `parts_missing` names any
+   gap) and queues the file. Everything goes straight to object storage. Quota is reserved up front (402 `quota_exceeded`
+   when it does not fit); a file may not exceed the size it declared.
+5. The `worker` container probes the file, measures its loudness (EBU R128, stored as `loudnessLufs` / `truePeakDb` for
+   volume matching), and transcodes it once into three AAC-LC `.m4a` renditions, then creates the track inside the release:
 
 | quality | bitrate | per hour | use |
 |---|---|---|---|
@@ -64,7 +68,8 @@ then upload. Full contract: `backend-api-artist-mode.md` in the notes folder.
 7. `GET /v1/playback/{trackId}?quality=low|medium|high` returns a presigned URL for that rendition (default medium) plus
    the available qualities with sizes. Originals are kept privately under `originals/` and never served.
 
-Storage is counted from the original files only. The verified badge is requested with
+Abandoned multipart uploads (and their stored parts) are aborted by the worker after about 90 minutes, or at once when
+the artist cancels. Storage is counted from the original files only. The verified badge is requested with
 `POST /v1/artists/{id}/verification-request` and decided by an admin (`/v1/admin/...`). Make an admin with SQL:
 
 ```powershell
@@ -137,7 +142,7 @@ playlists (CRUD, ordered items, add/remove/move, private or public), library (li
 followed artists, bulk `contains` check), creator uploads with low/medium/high transcoding and
 quality-aware playback, podcasts (RSS ingest, subscriptions, resume progress, background refresh), email verification,
 artist profiles with verification requests, releases with draft/schedule/publish, images, storage quota, admin review.
-Not yet: resumable multipart upload, loudness, play events and stats, offline downloads, reports and takedowns,
+Not yet: play events and stats, offline downloads, reports and takedowns,
 web billing, podcast discovery directory, new-episode notifications, listen-together, admin UI, album/artist detail endpoints, cover art, upload cleanup of abandoned files.
 
 ## Tests

@@ -31,14 +31,17 @@ type env struct {
 	router http.Handler
 }
 
-const testMax = 10 << 20
+const (
+	testMax  = 10 << 20
+	testPart = 5000 // files over twice this size use resumable uploads
+)
 
 func setup(t *testing.T) *env {
 	t.Helper()
 	pool := testutil.Pool(t)
 	blobs := blobtest.New()
 	store := NewStore(pool)
-	h := NewHandler(store, blobs, testMax, time.Hour)
+	h := NewHandler(store, blobs, Options{MaxBytes: testMax, URLTTL: time.Hour, PartSize: testPart})
 	r := chi.NewRouter()
 	r.Group(func(g chi.Router) {
 		g.Use(auth.Require(auth.NewTokenService(testutil.Secret, time.Minute)))
@@ -122,7 +125,7 @@ func TestCreateMakesADraftSingleAndHidesTrackID(t *testing.T) {
 	}
 	id, _ := b["id"].(string)
 	target, _ := b["upload"].(map[string]any)
-	if !strings.HasPrefix(id, "upl_") || target["method"] != "PUT" || !strings.Contains(target["url"].(string), "originals/"+id) {
+	if !strings.HasPrefix(id, "upl_") || target["type"] != "single" || target["method"] != "PUT" || !strings.Contains(target["url"].(string), "originals/"+id) {
 		t.Fatalf("bad response: %v", b)
 	}
 	if b["status"] != "pending" || b["trackId"] != nil || b["maxBytes"].(float64) != testMax {
@@ -432,7 +435,7 @@ func TestExpirePendingFreesStorage(t *testing.T) {
 	}
 	found := false
 	for _, k := range keys {
-		found = found || k == "originals/"+id
+		found = found || k.Key == "originals/"+id
 	}
 	if !found {
 		t.Fatalf("expired keys %v do not include the abandoned upload", keys)

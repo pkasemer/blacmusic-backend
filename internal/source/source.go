@@ -65,6 +65,8 @@ type PlaybackDescriptor struct {
 	URL           string            `json:"url,omitempty"`
 	ExpiresAt     *time.Time        `json:"expiresAt,omitempty"`
 	Format        *Format           `json:"format,omitempty"`
+	LoudnessLufs  *float64          `json:"loudnessLufs,omitempty"` // see Track
+	TruePeakDb    *float64          `json:"truePeakDb,omitempty"`
 	Quality       string            `json:"quality,omitempty"`   // the quality actually served
 	Qualities     []QualityOption   `json:"qualities,omitempty"` // every quality available for this track
 	Headers       map[string]string `json:"headers,omitempty"`
@@ -81,8 +83,12 @@ type Track struct {
 	AlbumTitle string `json:"albumTitle,omitempty"`
 	DurationMs int    `json:"durationMs"`
 	ArtworkURL string `json:"artworkUrl,omitempty"`
-	Source     string `json:"source,omitempty"`
-	SourceID   string `json:"sourceId,omitempty"`
+	// Loudness (EBU R128) of the track when known, for volume matching between
+	// tracks. A common target is -14 LUFS; keep gain + truePeakDb under -1.
+	LoudnessLufs *float64 `json:"loudnessLufs,omitempty"`
+	TruePeakDb   *float64 `json:"truePeakDb,omitempty"`
+	Source       string   `json:"source,omitempty"`
+	SourceID     string   `json:"sourceId,omitempty"`
 }
 
 // Provider is one pluggable audio source.

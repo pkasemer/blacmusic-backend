@@ -4,8 +4,10 @@ package blobtest
 import (
 	"bytes"
 	"context"
+	"fmt"
 	"io"
 	"os"
+	"sort"
 	"sync"
 	"time"
 
@@ -14,12 +16,20 @@ import (
 
 // Mem implements the Blobs interfaces of the upload and worker packages.
 type Mem struct {
-	mu   sync.Mutex
-	data map[string][]byte
+	mu      sync.Mutex
+	data    map[string][]byte
+	uploads map[string]*multipart // open multipart uploads by upload id
+	aborted []string
+	nextID  int
+}
+
+type multipart struct {
+	key   string
+	parts map[int][]byte
 }
 
 // New creates an empty store.
-func New() *Mem { return &Mem{data: map[string][]byte{}} }
+func New() *Mem { return &Mem{data: map[string][]byte{}, uploads: map[string]*multipart{}} }
 
 // Put stores bytes directly (simulates the client's PUT).
 func (m *Mem) Put(key string, b []byte) {
@@ -89,4 +99,83 @@ func (m *Mem) Open(_ context.Context, key string) (io.ReadCloser, int64, error) 
 		return nil, 0, storage.ErrNotFound
 	}
 	return io.NopCloser(bytes.NewReader(b)), int64(len(b)), nil
+}
+
+func (m *Mem) StartMultipart(_ context.Context, key string) (string, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.nextID++
+	id := fmt.Sprintf("mp-%d", m.nextID)
+	m.uploads[id] = &multipart{key: key, parts: map[int][]byte{}}
+	return id, nil
+}
+
+func (m *Mem) PresignPart(_ context.Context, key, uploadID string, number int, _ time.Duration) (string, error) {
+	return fmt.Sprintf("http://blobtest.invalid/part/%s?uploadId=%s&partNumber=%d", key, uploadID, number), nil
+}
+
+// PutPart simulates the client's PUT of one part.
+func (m *Mem) PutPart(uploadID string, number int, data []byte) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if mp, ok := m.uploads[uploadID]; ok {
+		mp.parts[number] = data
+	}
+}
+
+func (m *Mem) ListParts(_ context.Context, _, uploadID string) ([]storage.Part, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	mp, ok := m.uploads[uploadID]
+	if !ok {
+		return nil, storage.ErrNotFound
+	}
+	out := make([]storage.Part, 0, len(mp.parts))
+	for n, b := range mp.parts {
+		out = append(out, storage.Part{Number: n, Size: int64(len(b)), ETag: fmt.Sprintf("etag-%d", n)})
+	}
+	sort.Slice(out, func(i, j int) bool { return out[i].Number < out[j].Number })
+	return out, nil
+}
+
+func (m *Mem) CompleteMultipart(_ context.Context, key, uploadID string, parts []storage.Part) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	mp, ok := m.uploads[uploadID]
+	if !ok {
+		return storage.ErrNotFound
+	}
+	var all []byte
+	for _, p := range parts {
+		b, ok := mp.parts[p.Number]
+		if !ok {
+			return fmt.Errorf("part %d missing", p.Number)
+		}
+		all = append(all, b...)
+	}
+	m.data[key] = all
+	delete(m.uploads, uploadID)
+	return nil
+}
+
+func (m *Mem) AbortMultipart(_ context.Context, _, uploadID string) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	delete(m.uploads, uploadID)
+	m.aborted = append(m.aborted, uploadID)
+	return nil
+}
+
+// Aborted lists the multipart uploads that were aborted.
+func (m *Mem) Aborted() []string {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	return append([]string(nil), m.aborted...)
+}
+
+// OpenUploads returns the number of multipart uploads still open.
+func (m *Mem) OpenUploads() int {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	return len(m.uploads)
 }
