@@ -6,3 +6,5 @@
 *.out
 .idea/
 .vscode/
+tools/catalog-import/audio/
+tools/catalog-import/.accounts/

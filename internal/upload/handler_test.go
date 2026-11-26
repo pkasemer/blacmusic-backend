@@ -17,6 +17,7 @@ import (
 	"github.com/blacmusic/backend/internal/artist"
 	"github.com/blacmusic/backend/internal/auth"
 	"github.com/blacmusic/backend/internal/blobtest"
+	"github.com/blacmusic/backend/internal/release"
 	"github.com/blacmusic/backend/internal/testutil"
 )
 
@@ -42,10 +43,12 @@ func setup(t *testing.T) *env {
 	blobs := blobtest.New()
 	store := NewStore(pool)
 	h := NewHandler(store, blobs, Options{MaxBytes: testMax, URLTTL: time.Hour, PartSize: testPart})
+	h.Tracks = release.NewStore(pool, blobs, "http://api.test")
 	r := chi.NewRouter()
 	r.Group(func(g chi.Router) {
 		g.Use(auth.Require(auth.NewTokenService(testutil.Secret, time.Minute)))
 		g.Route("/uploads", h.Routes)
+		h.TrackRoutes(g)
 	})
 	return &env{t: t, pool: pool, blobs: blobs, store: store, router: r}
 }
@@ -452,5 +455,122 @@ func TestUnauthenticated(t *testing.T) {
 	e := setup(t)
 	if code, _ := e.do("GET", "/uploads", "garbage", nil); code != 401 {
 		t.Fatalf("bad token = %d, want 401", code)
+	}
+}
+
+func TestUploadGenreMustComeFromTheList(t *testing.T) {
+	e := setup(t)
+	tok, _, _ := e.artistUser(testutil.GiB)
+
+	b := body(100)
+	b["genre"] = "Afrobeatz"
+	if code, resp := e.do("POST", "/uploads", tok, b); code != 422 || errCode(resp) != "invalid_genre" {
+		t.Fatalf("unknown genre = %d %v, want 422 invalid_genre", code, resp)
+	}
+
+	b["genre"] = "bongo flava"
+	code, resp := e.do("POST", "/uploads", tok, b)
+	if code != 201 || resp["genre"] != "Bongo Flava" {
+		t.Fatalf("a listed genre in any spelling = %d %v, want 201 with the canonical name", code, resp)
+	}
+	// The draft single created for the track carries the canonical genre too.
+	var g string
+	if err := e.pool.QueryRow(context.Background(), `SELECT genre FROM albums WHERE id=$1`, resp["releaseId"]).Scan(&g); err != nil || g != "Bongo Flava" {
+		t.Fatalf("release genre = %q (%v)", g, err)
+	}
+
+	delete(b, "genre")
+	if code, _ := e.do("POST", "/uploads", tok, b); code != 201 {
+		t.Fatalf("no genre = %d, want 201", code)
+	}
+}
+
+func TestReplaceAudioOfADraftTrack(t *testing.T) {
+	e := setup(t)
+	tok, userID, artistID := e.artistUser(testutil.GiB)
+	ctx := context.Background()
+	rel := testutil.Release(t, e.pool, artistID, "Draft EP", "album", "draft")
+	track, _ := testutil.ReadyTrack(t, e.pool, userID, artistID, rel, "Track One", 4000, "draft")
+	if _, err := e.pool.Exec(ctx, `UPDATE tracks SET genre='Bongo Flava', track_number=3, explicit=true WHERE id=$1`, track); err != nil {
+		t.Fatal(err)
+	}
+	e.blobs.Put("originals/"+track, []byte("old"))
+	before := e.quota(artistID).UsedStorageBytes
+
+	code, b := e.do("POST", "/tracks/"+track+"/replace-audio", tok, map[string]any{
+		"filename": "better.flac", "sizeBytes": 1000, "rightsAccepted": true, "termsVersion": "2024-01",
+	})
+	if code != 201 {
+		t.Fatalf("replace = %d %v", code, b)
+	}
+	if b["replacedTrackId"] != track || b["releaseId"] != rel || b["title"] != "Track One" || b["status"] != "pending" {
+		t.Fatalf("response = %v", b)
+	}
+	if up, _ := b["upload"].(map[string]any); up == nil || up["url"] == "" {
+		t.Fatalf("no upload target: %v", b)
+	}
+	// The old track is gone with its storage, the new upload carries the old metadata.
+	var n int
+	_ = e.pool.QueryRow(ctx, `SELECT count(*) FROM tracks WHERE id=$1`, track).Scan(&n)
+	if n != 0 {
+		t.Fatal("the old track should be deleted")
+	}
+	if _, ok := e.blobs.Get("originals/" + track); ok {
+		t.Fatal("the old original should be removed from storage")
+	}
+	var genre string
+	var num *int
+	var explicit bool
+	if err := e.pool.QueryRow(ctx, `SELECT genre, track_number, explicit FROM uploads WHERE id=$1`, b["id"]).Scan(&genre, &num, &explicit); err != nil {
+		t.Fatal(err)
+	}
+	if genre != "Bongo Flava" || num == nil || *num != 3 || !explicit {
+		t.Fatalf("metadata not carried over: %q %v %v", genre, num, explicit)
+	}
+	if used := e.quota(artistID).UsedStorageBytes; used != 1000 {
+		t.Fatalf("used storage = %d (was %d), want only the new file's 1000", used, before)
+	}
+}
+
+func TestReplaceAudioKeepsTheOldTrackWhenTheNewFileIsRejected(t *testing.T) {
+	e := setup(t)
+	tok, userID, artistID := e.artistUser(testutil.GiB)
+	rel := testutil.Release(t, e.pool, artistID, "Draft", "single", "draft")
+	track, _ := testutil.ReadyTrack(t, e.pool, userID, artistID, rel, "Keep me", 4000, "draft")
+
+	for name, payload := range map[string]map[string]any{
+		"rights not accepted": {"filename": "a.flac", "sizeBytes": 10, "rightsAccepted": false, "termsVersion": "2024-01"},
+		"empty":               {"filename": "a.flac", "sizeBytes": 0, "rightsAccepted": true, "termsVersion": "2024-01"},
+		"too large":           {"filename": "a.flac", "sizeBytes": testMax + 1, "rightsAccepted": true, "termsVersion": "2024-01"},
+	} {
+		if code, b := e.do("POST", "/tracks/"+track+"/replace-audio", tok, payload); code != 422 {
+			t.Fatalf("%s = %d %v, want 422", name, code, b)
+		}
+	}
+	var n int
+	_ = e.pool.QueryRow(context.Background(), `SELECT count(*) FROM tracks WHERE id=$1`, track).Scan(&n)
+	if n != 1 {
+		t.Fatal("a rejected replacement must leave the track in place")
+	}
+}
+
+func TestReplaceAudioOnlyForOwnDraftTracks(t *testing.T) {
+	e := setup(t)
+	tok, userID, artistID := e.artistUser(testutil.GiB)
+	other, _, _ := e.artistUser(testutil.GiB)
+	draftRel := testutil.Release(t, e.pool, artistID, "Draft", "single", "draft")
+	liveRel := testutil.Release(t, e.pool, artistID, "Live", "single", "public")
+	draft, _ := testutil.ReadyTrack(t, e.pool, userID, artistID, draftRel, "D", 100, "draft")
+	live, _ := testutil.ReadyTrack(t, e.pool, userID, artistID, liveRel, "L", 100, "public")
+	payload := map[string]any{"filename": "a.flac", "sizeBytes": 10, "rightsAccepted": true, "termsVersion": "2024-01"}
+
+	if code, b := e.do("POST", "/tracks/"+live+"/replace-audio", tok, payload); code != 409 || errCode(b) != "not_draft" {
+		t.Fatalf("live track = %d %v, want 409 not_draft", code, b)
+	}
+	if code, b := e.do("POST", "/tracks/"+draft+"/replace-audio", other, payload); code != 404 {
+		t.Fatalf("someone else's track = %d %v, want 404", code, b)
+	}
+	if code, _ := e.do("POST", "/tracks/trk_missing/replace-audio", tok, payload); code != 404 {
+		t.Fatalf("unknown track = %d, want 404", code)
 	}
 }

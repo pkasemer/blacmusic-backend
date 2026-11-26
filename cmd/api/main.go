@@ -70,17 +70,12 @@ func run() error {
 	// Register audio sources. New providers (podcast, audius, jamendo, a
 	// client-resolved youtube reference provider...) are added here.
 	reg := source.NewRegistry()
-	reg.Register(native.New(pool, store, cfg.PlaybackURLTTL))
+	reg.Register(native.New(pool, store, cfg.PlaybackURLTTL, cfg.PublicAPIURL))
 	reg.Register(podcastsrc.New(pool))
 
-	var mail mailer.Mailer = mailer.Log{}
-	if cfg.SMTPHost != "" {
-		mail, err = mailer.NewSMTP(cfg.SMTPHost, cfg.SMTPPort, cfg.SMTPUser, cfg.SMTPPassword, cfg.SMTPFrom)
-		if err != nil {
-			return err
-		}
-	} else if cfg.Env != "development" {
-		return errors.New("SMTP_HOST must be set outside development")
+	mail, err := mailer.FromConfig(&cfg)
+	if err != nil {
+		return err
 	}
 
 	srv := &http.Server{

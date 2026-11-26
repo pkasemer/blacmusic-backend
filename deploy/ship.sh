@@ -46,6 +46,10 @@ for i in $(seq 1 60); do
 done
 curl -sS http://127.0.0.1:8080/readyz; echo
 docker compose -f docker-compose.prod.yml ps --format 'table {{.Service}}\t{{.Status}}'
-# keep the last few image versions only
+# keep the newest three versions of each backend image (for rolling back); images in use cannot be removed
+for repo in blacmusic-api blacmusic-worker; do
+  { docker images "$repo" --format '{{.Tag}}' | grep -E '^[0-9]{14}$' || true; } | sort -r | tail -n +4 |
+    while read -r old; do docker rmi "$repo:$old" >/dev/null 2>&1 || true; done
+done
 docker image prune -f >/dev/null
 REMOTE

@@ -27,6 +27,8 @@ type Maintenance struct {
 	blobs       Blobs
 	expireAfter time.Duration // how long a pending upload may wait for its file
 	ffmpeg      string
+
+	lastPurge time.Time // the daily deletion of old search records
 }
 
 // NewMaintenance creates the maintenance loop. expireAfter should exceed the
@@ -79,6 +81,15 @@ func (m *Maintenance) RunOnce(ctx context.Context) {
 	}
 
 	m.backfillLoudness(ctx, 3)
+	m.purgeSearches(ctx)
+
+	if n, err := image.ExpireUnused(ctx, m.pool, m.blobs, 24*time.Hour); err != nil {
+		if ctx.Err() == nil {
+			slog.Error("expire unused images", "err", err)
+		}
+	} else if n > 0 {
+		slog.Info("removed images nothing uses any more", "count", n)
+	}
 
 	if n, err := image.ExpirePending(ctx, m.pool, m.blobs, 2*time.Hour); err != nil {
 		if ctx.Err() == nil {
@@ -86,6 +97,24 @@ func (m *Maintenance) RunOnce(ctx context.Context) {
 		}
 	} else if n > 0 {
 		slog.Info("expired abandoned images", "count", n)
+	}
+}
+
+// purgeSearches deletes search records older than 180 days (checked once an hour).
+func (m *Maintenance) purgeSearches(ctx context.Context) {
+	if time.Since(m.lastPurge) < time.Hour {
+		return
+	}
+	m.lastPurge = time.Now()
+	tag, err := m.pool.Exec(ctx, `DELETE FROM search_queries WHERE at < now() - interval '180 days'`)
+	if err != nil {
+		if ctx.Err() == nil {
+			slog.Error("purge old searches", "err", err)
+		}
+		return
+	}
+	if n := tag.RowsAffected(); n > 0 {
+		slog.Info("deleted old search records", "count", n)
 	}
 }
 

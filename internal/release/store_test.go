@@ -2,6 +2,7 @@ package release
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"strings"
 	"testing"
@@ -11,6 +12,7 @@ import (
 
 	"github.com/blacmusic/backend/internal/artist"
 	"github.com/blacmusic/backend/internal/blobtest"
+	"github.com/blacmusic/backend/internal/genre"
 	"github.com/blacmusic/backend/internal/playlist"
 	"github.com/blacmusic/backend/internal/testutil"
 )
@@ -57,12 +59,12 @@ func TestCreateValidatesAndNeedsAnArtist(t *testing.T) {
 	}
 
 	uid, _ := e.artistUser()
-	r, err := e.store.Create(ctx, uid, Input{Type: "album", Title: "  Debut  ", Genre: "Afrobeat", ReleaseDate: "2024-03-31"})
+	r, err := e.store.Create(ctx, uid, Input{Type: "album", Title: "  Debut  ", Genre: "Afrobeats", ReleaseDate: "2024-03-31"})
 	if err != nil {
 		t.Fatal(err)
 	}
 	if !strings.HasPrefix(r.ID, "alb_") || r.Title != "Debut" || r.Visibility != "draft" || r.ReleaseDate != "2024-03-31" ||
-		r.Genre != "Afrobeat" || !r.Mine || r.Artist == nil || r.Type != "album" {
+		r.Genre != "Afrobeats" || !r.Mine || r.Artist == nil || r.Type != "album" {
 		t.Fatalf("created: %+v", r)
 	}
 
@@ -109,6 +111,16 @@ func TestDraftsArePrivateUntilPublished(t *testing.T) {
 	seen, err := e.store.Get(ctx, rel, stranger)
 	if err != nil || len(seen.Tracks) != 2 || seen.Mine || seen.Tracks[0].Visibility != "" {
 		t.Fatalf("stranger after publish: %+v %v", seen, err)
+	}
+	// The artist's picture is the owner's avatar.
+	var avatar string
+	if err := e.pool.QueryRow(ctx, `INSERT INTO images (owner_id, purpose, status, original_key, size_bytes)
+		VALUES ($1,'avatar','ready','k',1) RETURNING id`, uid).Scan(&avatar); err != nil {
+		t.Fatal(err)
+	}
+	e.pool.Exec(ctx, `UPDATE users SET avatar_image_id = $2 WHERE id = $1`, uid, avatar) //nolint:errcheck
+	if withPic, _ := e.store.Get(ctx, rel, stranger); withPic.Artist == nil || withPic.Artist.ImageURL != "http://api.test/v1/media/"+avatar+"/medium.jpg" {
+		t.Fatalf("release.artist.imageUrl = %+v, want the owner's avatar", withPic.Artist)
 	}
 	if list, _ := e.store.ListByArtist(ctx, artistID, stranger, 50, 0); len(list) != 1 || list[0].ID != rel || list[0].TrackCount != 2 {
 		t.Fatalf("artist page: %v", list)
@@ -336,7 +348,7 @@ func TestEditAndDeleteATrack(t *testing.T) {
 
 	// The track sits in a listener's playlist between two others and in their library.
 	listener := testutil.User(t, e.pool, "user", true)
-	ps := playlist.NewStore(e.pool)
+	ps := playlist.NewStore(e.pool, "http://test")
 	pl, err := ps.Create(ctx, listener, "Mix", "", false)
 	if err != nil {
 		t.Fatal(err)
@@ -478,5 +490,255 @@ func TestMineAndOwnerView(t *testing.T) {
 	other := testutil.User(t, e.pool, "user", true)
 	if list, _ = e.store.ListMine(ctx, other, 50, 0); len(list) != 0 {
 		t.Fatalf("someone else's releases leaked: %v", list)
+	}
+}
+
+func TestGenresMustComeFromTheList(t *testing.T) {
+	e := setup(t)
+	ctx := context.Background()
+	uid, artistID := e.artistUser()
+
+	// Names are matched without regard to case (or by id) and stored in their canonical form.
+	r, err := e.store.Create(ctx, uid, Input{Type: "single", Title: "G", Genre: "  hip-hop/RAP "})
+	if err != nil || r.Genre != "Hip-Hop/Rap" {
+		t.Fatalf("create with a loose spelling: %+v %v", r, err)
+	}
+	for _, bad := range []string{"Afrobeatz", "Rock and Roll", "<b>x</b>"} {
+		if _, err := e.store.Create(ctx, uid, Input{Type: "single", Title: "G", Genre: bad}); !errors.Is(err, genre.ErrInvalid) {
+			t.Errorf("create with %q = %v, want ErrInvalid", bad, err)
+		}
+	}
+	if r, err = e.store.Create(ctx, uid, Input{Type: "single", Title: "No genre"}); err != nil || r.Genre != "" {
+		t.Fatalf("a release without a genre is fine: %+v %v", r, err)
+	}
+
+	// A genre saved before the list existed is returned unchanged and survives edits that do not touch it.
+	rel := testutil.Release(t, e.pool, artistID, "Legacy", "album", "draft")
+	if _, err := e.pool.Exec(ctx, `UPDATE albums SET genre = 'Kadongo Kamu (old)' WHERE id=$1`, rel); err != nil {
+		t.Fatal(err)
+	}
+	title, same := "Renamed Legacy", "Kadongo Kamu (old)"
+	got, err := e.store.Update(ctx, rel, uid, Patch{Title: &title})
+	if err != nil || got.Genre != "Kadongo Kamu (old)" {
+		t.Fatalf("an unrelated edit must keep the old genre: %+v %v", got, err)
+	}
+	if got, err = e.store.Update(ctx, rel, uid, Patch{Genre: &same}); err != nil || got.Genre != "Kadongo Kamu (old)" {
+		t.Fatalf("re-sending the unchanged old genre must not fail: %+v %v", got, err)
+	}
+	bad := "Kadongo Kamu (new spelling)"
+	if _, err := e.store.Update(ctx, rel, uid, Patch{Genre: &bad}); !errors.Is(err, genre.ErrInvalid) {
+		t.Fatalf("changing it to another free-text value = %v, want ErrInvalid", err)
+	}
+	pick := "gospel"
+	if got, err = e.store.Update(ctx, rel, uid, Patch{Genre: &pick}); err != nil || got.Genre != "Gospel" {
+		t.Fatalf("switching to a list value: %+v %v", got, err)
+	}
+	clear := ""
+	if got, err = e.store.Update(ctx, rel, uid, Patch{Genre: &clear}); err != nil || got.Genre != "" {
+		t.Fatalf("clearing the genre: %+v %v", got, err)
+	}
+
+	// Same rules for tracks.
+	_, tracks := e.draftRelease(uid, artistID, "album", 1)
+	if _, err := e.pool.Exec(ctx, `UPDATE tracks SET genre = 'old free text' WHERE id=$1`, tracks[0]); err != nil {
+		t.Fatal(err)
+	}
+	t1 := "New Title"
+	if tv, err := e.store.UpdateTrack(ctx, tracks[0], uid, TrackPatch{Title: &t1}); err != nil || tv.Genre != "old free text" {
+		t.Fatalf("track edit keeps its old genre: %+v %v", tv, err)
+	}
+	nope := "not a genre"
+	if _, err := e.store.UpdateTrack(ctx, tracks[0], uid, TrackPatch{Genre: &nope}); !errors.Is(err, genre.ErrInvalid) {
+		t.Fatalf("track genre not in the list = %v, want ErrInvalid", err)
+	}
+	ok := "AMAPIANO"
+	if tv, err := e.store.UpdateTrack(ctx, tracks[0], uid, TrackPatch{Genre: &ok}); err != nil || tv.Genre != "Amapiano" {
+		t.Fatalf("track genre from the list: %+v %v", tv, err)
+	}
+}
+
+// Releases and the tracks inside them say whether the artist is verified: always present.
+func TestReleasesCarryTheVerifiedFlag(t *testing.T) {
+	e := setup(t)
+	ctx := context.Background()
+	user := testutil.User(t, e.pool, "user", true)
+	artist := testutil.Artist(t, e.pool, user, testutil.Unique("Flag"), testutil.GiB)
+	rel := testutil.Release(t, e.pool, artist, "Flagged", "single", "public")
+	track, _ := testutil.ReadyTrack(t, e.pool, user, artist, rel, "Flagged song", 10, "public")
+
+	view := func() (artistFlag, trackFlag any) {
+		t.Helper()
+		r, err := e.store.Get(ctx, rel, "")
+		if err != nil {
+			t.Fatal(err)
+		}
+		raw, _ := json.Marshal(r)
+		var m struct {
+			Artist map[string]any   `json:"artist"`
+			Tracks []map[string]any `json:"tracks"`
+		}
+		if err := json.Unmarshal(raw, &m); err != nil || len(m.Tracks) != 1 {
+			t.Fatalf("release json = %s", raw)
+		}
+		return m.Artist["verified"], m.Tracks[0]["artistVerified"]
+	}
+	if a, tr := view(); a != false || tr != false {
+		t.Fatalf("unverified: artist.verified %v, track artistVerified %v, want false/false (always sent)", a, tr)
+	}
+	e.pool.Exec(ctx, `UPDATE artists SET verification = 'verified' WHERE id = $1`, artist) //nolint:errcheck
+	if a, tr := view(); a != true || tr != true {
+		t.Fatalf("verified: artist.verified %v, track artistVerified %v", a, tr)
+	}
+	// editing a track returns the flag too
+	tv, err := e.store.UpdateTrack(ctx, track, user, TrackPatch{Title: ptrStr("Renamed")})
+	if err != nil || !tv.ArtistVerified {
+		t.Fatalf("UpdateTrack = %+v %v", tv, err)
+	}
+}
+
+func ptrStr(s string) *string { return &s }
+
+func TestSearchReleasesAndKinds(t *testing.T) {
+	e := setup(t)
+	ctx := context.Background()
+	tok := "zr" + testutil.Unique("s")
+	user := testutil.User(t, e.pool, "user", true)
+	artist := testutil.Artist(t, e.pool, user, "Band "+tok, testutil.GiB)
+	other := testutil.Artist(t, e.pool, testutil.User(t, e.pool, "user", true), testutil.Unique("Else"), testutil.GiB)
+	mk := func(owner, artistID, title, typ, visibility string, tracks int) string {
+		rel := testutil.Release(e.t, e.pool, artistID, title, typ, visibility)
+		for i := 0; i < tracks; i++ {
+			testutil.ReadyTrack(e.t, e.pool, owner, artistID, rel, "T", 1, visibility)
+		}
+		return rel
+	}
+	exact := mk(user, other, tok, "single", "public", 1)            // title equals q
+	prefix := mk(user, other, tok+" Vol 1", "album", "public", 3)   // an EP
+	word := mk(user, other, "Best of "+tok, "album", "public", 7)   // a full album
+	byArtist := mk(user, artist, "Unrelated", "album", "public", 1) // matches only through the artist's name
+	mk(user, other, tok+" draft", "album", "draft", 2)              // not public
+
+	ids := func(typ string) []string {
+		t.Helper()
+		list, err := e.store.Search(ctx, tok, typ, 50, 0)
+		if err != nil {
+			t.Fatal(err)
+		}
+		var out []string
+		for _, r := range list {
+			out = append(out, r.ID)
+		}
+		return out
+	}
+	eq := func(name string, got, want []string) {
+		t.Helper()
+		if strings.Join(got, ",") != strings.Join(want, ",") {
+			t.Fatalf("%s = %v, want %v", name, got, want)
+		}
+	}
+	eq("all", ids(""), []string{exact, prefix, word, byArtist})
+	eq("type=all", ids("all"), []string{exact, prefix, word, byArtist})
+	eq("single", ids("single"), []string{exact})
+	eq("ep", ids("ep"), []string{prefix, byArtist})
+	eq("album", ids("album"), []string{word})
+	if _, err := e.store.Search(ctx, tok, "lp", 10, 0); err == nil {
+		t.Fatal("an unknown type was accepted")
+	}
+
+	// every release says what to tag it with
+	list, _ := e.store.Search(ctx, tok, "all", 50, 0)
+	kinds := map[string]string{}
+	for _, r := range list {
+		kinds[r.ID] = r.Kind
+		if r.Artist == nil {
+			t.Fatalf("release without an artist: %+v", r)
+		}
+	}
+	if kinds[exact] != "single" || kinds[prefix] != "ep" || kinds[word] != "album" || kinds[byArtist] != "ep" {
+		t.Fatalf("kinds = %v", kinds)
+	}
+	// and so does a single release lookup
+	if r, err := e.store.Get(ctx, word, ""); err != nil || r.Kind != "album" {
+		t.Fatalf("Get = %+v %v", r, err)
+	}
+	if got := KindOf("album", 6); got != "ep" {
+		t.Fatalf("6 tracks = %s", got)
+	}
+	if got := KindOf("album", 7); got != "album" {
+		t.Fatalf("7 tracks = %s", got)
+	}
+}
+
+func TestReleasesCarryLargeCoverAndTotalDuration(t *testing.T) {
+	e := setup(t)
+	ctx := context.Background()
+	user := testutil.User(t, e.pool, "user", true)
+	artist := testutil.Artist(t, e.pool, user, testutil.Unique("Big"), testutil.GiB)
+	rel := testutil.Release(t, e.pool, artist, "Big Cover", "album", "public")
+	plain := testutil.Release(t, e.pool, artist, "External Cover", "single", "public")
+	for i := 0; i < 2; i++ { // ReadyTrack makes 180 s tracks
+		testutil.ReadyTrack(t, e.pool, user, artist, rel, "T", 1, "public")
+	}
+	testutil.ReadyTrack(t, e.pool, user, artist, plain, "T", 1, "public")
+	e.pool.Exec(ctx, `UPDATE albums SET artwork_url = 'http://api.test/v1/media/img_0123456789abcdef0123456789abcdef/medium.jpg' WHERE id = $1`, rel) //nolint:errcheck
+	e.pool.Exec(ctx, `UPDATE albums SET artwork_url = 'https://cdn.example.com/old.jpg' WHERE id = $1`, plain)                                        //nolint:errcheck
+
+	get, err := e.store.Get(ctx, rel, "")
+	if err != nil || get.TotalDurationSec != 360 || get.ArtworkLargeURL != "http://api.test/v1/media/img_0123456789abcdef0123456789abcdef/large.jpg" {
+		t.Fatalf("Get = %+v %v", get, err)
+	}
+	found, err := e.store.Search(ctx, "Big Cover", "all", 5, 0)
+	if err != nil || len(found) != 1 || found[0].TotalDurationSec != 360 || found[0].ArtworkLargeURL == "" {
+		t.Fatalf("Search = %+v %v (lists carry the totals too)", found, err)
+	}
+	other, err := e.store.Get(ctx, plain, "")
+	if err != nil || other.ArtworkLargeURL != "" || other.TotalDurationSec != 180 {
+		t.Fatalf("a cover that is not ours has no large version: %+v %v", other, err)
+	}
+}
+
+func TestRelatedReleases(t *testing.T) {
+	e := setup(t)
+	ctx := context.Background()
+	user := testutil.User(t, e.pool, "user", true)
+	artist := testutil.Artist(t, e.pool, user, testutil.Unique("Rel"), testutil.GiB)
+	other := testutil.Artist(t, e.pool, testutil.User(t, e.pool, "user", true), testutil.Unique("Other"), testutil.GiB)
+	g := testutil.Unique("genre")
+	mk := func(owner, artistID, genre, visibility string) string {
+		rel := testutil.Release(e.t, e.pool, artistID, "R "+genre, "single", visibility)
+		e.pool.Exec(ctx, `UPDATE albums SET genre = $2 WHERE id = $1`, rel, genre) //nolint:errcheck
+		testutil.ReadyTrack(e.t, e.pool, owner, artistID, rel, "T", 1, visibility)
+		return rel
+	}
+	base := mk(user, artist, g, "public")
+	sameGenre := mk(user, other, g, "public")
+	sameArtist := mk(user, artist, "unrelated-"+g, "public")
+	mk(user, other, g, "draft")               // not public
+	mk(user, other, "different-"+g, "public") // nothing in common
+
+	list, err := e.store.Related(ctx, base, "", 12)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var ids []string
+	for _, r := range list {
+		ids = append(ids, r.ID)
+		if r.Kind == "" || r.Artist == nil {
+			t.Fatalf("release shape = %+v", r)
+		}
+	}
+	if len(ids) != 2 || ids[0] != sameGenre || ids[1] != sameArtist {
+		t.Fatalf("related = %v, want the same genre %s, then the same artist %s (never %s itself)", ids, sameGenre, sameArtist, base)
+	}
+	if list, _ = e.store.Related(ctx, base, "", 1); len(list) != 1 || list[0].ID != sameGenre {
+		t.Fatalf("limit = %+v", list)
+	}
+	// a draft release cannot be asked about by a stranger
+	draft := mk(user, artist, g, "draft")
+	if _, err := e.store.Related(ctx, draft, "", 12); err != ErrNotFound {
+		t.Fatalf("draft by a stranger = %v, want ErrNotFound", err)
+	}
+	if _, err := e.store.Related(ctx, draft, user, 12); err != nil {
+		t.Fatalf("draft by its owner = %v", err)
 	}
 }

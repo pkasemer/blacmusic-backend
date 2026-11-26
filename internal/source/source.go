@@ -79,10 +79,23 @@ type Track struct {
 	Title      string `json:"title"`
 	ArtistID   string `json:"artistId,omitempty"`
 	ArtistName string `json:"artistName,omitempty"`
+	// ArtistImageURL is the artist's profile picture (the same one as their user avatar).
+	ArtistImageURL string `json:"artistImageUrl,omitempty"`
+	// ArtistVerified is true when the artist has been verified (the app shows a check mark). Always sent.
+	ArtistVerified bool `json:"artistVerified"`
+	// HasLyrics is true when GET /v1/tracks/{id}/lyrics has something (the app shows the Lyrics button). Always sent.
+	HasLyrics bool `json:"hasLyrics"`
+	// HasCredits is true when the track has credits of its own or its release does. Always sent.
+	HasCredits bool   `json:"hasCredits"`
 	AlbumID    string `json:"albumId,omitempty"`
 	AlbumTitle string `json:"albumTitle,omitempty"`
 	DurationMs int    `json:"durationMs"`
 	ArtworkURL string `json:"artworkUrl,omitempty"`
+	// ArtworkLargeURL is the same cover at about 1280 px (for a big hero); absent when there is none.
+	ArtworkLargeURL string `json:"artworkLargeUrl,omitempty"`
+	Genre           string `json:"genre,omitempty"` // the track's genre, else its release's
+	Explicit        bool   `json:"explicit"`
+	ReleaseDate     string `json:"releaseDate,omitempty"` // YYYY-MM-DD: the release date, else the day it went live
 	// Loudness (EBU R128) of the track when known, for volume matching between
 	// tracks. A common target is -14 LUFS; keep gain + truePeakDb under -1.
 	LoudnessLufs *float64 `json:"loudnessLufs,omitempty"`

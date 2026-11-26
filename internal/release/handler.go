@@ -5,11 +5,13 @@ import (
 	"log/slog"
 	"net/http"
 	"strconv"
+	"strings"
 	"time"
 
 	"github.com/go-chi/chi/v5"
 
 	"github.com/blacmusic/backend/internal/auth"
+	"github.com/blacmusic/backend/internal/genre"
 	"github.com/blacmusic/backend/internal/httpx"
 )
 
@@ -29,6 +31,10 @@ func (h *Handler) Routes(r chi.Router) {
 	r.Post("/releases/{id}/publish", h.publish)
 	r.Post("/releases/{id}/unpublish", h.unpublish)
 	r.Get("/me/releases", h.mine)
+	r.Get("/browse/albums", h.browse)
+	r.Get("/search/albums", h.search)
+	r.Get("/releases/{id}/related", h.related)
+	r.Get("/albums/{id}/related", h.related)
 	r.Get("/artists/{id}/releases", h.byArtist)
 
 	r.Patch("/tracks/{id}", h.updateTrack)
@@ -144,6 +150,71 @@ func (h *Handler) mine(w http.ResponseWriter, r *http.Request) {
 	httpx.JSON(w, http.StatusOK, map[string]any{"releases": list})
 }
 
+// browse serves GET /v1/browse/albums?sort=new|popular&type=album|single|all&limit=&offset=
+func (h *Handler) browse(w http.ResponseWriter, r *http.Request) {
+	limit, offset := 20, 0
+	if n, err := strconv.Atoi(r.URL.Query().Get("limit")); err == nil && n > 0 {
+		limit = min(n, 50)
+	}
+	if n, err := strconv.Atoi(r.URL.Query().Get("offset")); err == nil && n > 0 {
+		offset = min(n, 10000)
+	}
+	list, err := h.store.Browse(r.Context(), r.URL.Query().Get("sort"), r.URL.Query().Get("type"), limit, offset)
+	var ve *ValidationError
+	if errors.As(err, &ve) {
+		httpx.Error(w, http.StatusBadRequest, "bad_request", ve.Msg)
+		return
+	}
+	if err != nil {
+		fail(w, err)
+		return
+	}
+	httpx.JSON(w, http.StatusOK, map[string]any{"releases": list})
+}
+
+// search handles GET /v1/search/albums?q=&type=all|single|ep|album&limit=&offset= (public releases only).
+func (h *Handler) search(w http.ResponseWriter, r *http.Request) {
+	q := strings.TrimSpace(r.URL.Query().Get("q"))
+	if q == "" {
+		httpx.Error(w, http.StatusBadRequest, "bad_request", "q is required")
+		return
+	}
+	limit, offset := 20, 0
+	if n, err := strconv.Atoi(r.URL.Query().Get("limit")); err == nil && n > 0 {
+		limit = min(n, 50)
+	}
+	if n, err := strconv.Atoi(r.URL.Query().Get("offset")); err == nil && n > 0 {
+		offset = min(n, 10000)
+	}
+	list, err := h.store.Search(r.Context(), q, r.URL.Query().Get("type"), limit, offset)
+	var ve *ValidationError
+	if errors.As(err, &ve) {
+		httpx.Error(w, http.StatusBadRequest, "bad_request", ve.Msg)
+		return
+	}
+	if err != nil {
+		fail(w, err)
+		return
+	}
+	httpx.JSON(w, http.StatusOK, map[string]any{"releases": list})
+}
+
+// related handles GET /v1/releases/{id}/related?limit= (default 12, at most 50): public releases of the same
+// genre, then more from the same artist.
+func (h *Handler) related(w http.ResponseWriter, r *http.Request) {
+	uid, _ := auth.UserID(r.Context())
+	limit := 12
+	if n, err := strconv.Atoi(r.URL.Query().Get("limit")); err == nil && n > 0 {
+		limit = min(n, 50)
+	}
+	list, err := h.store.Related(r.Context(), chi.URLParam(r, "id"), uid, limit)
+	if err != nil {
+		fail(w, err)
+		return
+	}
+	httpx.JSON(w, http.StatusOK, map[string]any{"releases": list})
+}
+
 func (h *Handler) byArtist(w http.ResponseWriter, r *http.Request) {
 	uid, _ := auth.UserID(r.Context())
 	limit, offset := page(r)
@@ -205,12 +276,18 @@ func fail(w http.ResponseWriter, err error) {
 	switch {
 	case errors.As(err, &ve):
 		httpx.Error(w, http.StatusUnprocessableEntity, "validation_error", ve.Msg)
+	case errors.Is(err, genre.ErrInvalid):
+		httpx.Error(w, http.StatusUnprocessableEntity, "invalid_genre", err.Error())
 	case errors.Is(err, ErrNotFound):
 		httpx.Error(w, http.StatusNotFound, "not_found", "not found")
 	case errors.Is(err, ErrNoArtist):
 		httpx.Error(w, http.StatusForbidden, "artist_required", "create your artist profile first")
 	case errors.Is(err, ErrUploadsPending):
 		httpx.Error(w, http.StatusConflict, "uploads_pending", "some files are still uploading or processing; wait until they are ready")
+	case errors.Is(err, ErrTakenDown):
+		httpx.Error(w, http.StatusConflict, "taken_down", "this release was taken down by the Blac Music team; contact support")
+	case errors.Is(err, ErrArtistBanned):
+		httpx.Error(w, http.StatusForbidden, "account_banned", "this artist profile has been suspended")
 	case errors.Is(err, ErrProcessing):
 		httpx.Error(w, http.StatusConflict, "processing", "a file in this release is being processed right now; try again in a moment")
 	default:

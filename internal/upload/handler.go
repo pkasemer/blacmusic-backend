@@ -14,6 +14,7 @@ import (
 	"github.com/go-chi/chi/v5"
 
 	"github.com/blacmusic/backend/internal/auth"
+	"github.com/blacmusic/backend/internal/genre"
 	"github.com/blacmusic/backend/internal/httpx"
 	"github.com/blacmusic/backend/internal/storage"
 )
@@ -38,11 +39,19 @@ type Options struct {
 	PartSize int64         // part size of resumable uploads; files over twice this size use them
 }
 
+// Tracks removes a finished track; the release store provides it.
+type Tracks interface {
+	DeleteTrack(ctx context.Context, id, userID string) error
+}
+
 // Handler serves /v1/uploads. Uploading needs an artist profile.
 type Handler struct {
-	store *Store
-	blobs Blobs
-	opt   Options
+	// OnAdminComplete, when set, is told when an administrator completed an upload (the admin API writes its audit row).
+	OnAdminComplete func(r *http.Request, u *Upload)
+	store           *Store
+	blobs           Blobs
+	opt             Options
+	Tracks          Tracks // set to enable replacing the file of a draft track
 }
 
 // NewHandler creates the handler.
@@ -60,7 +69,13 @@ func (h *Handler) Routes(r chi.Router) {
 	r.Delete("/{id}", h.delete)
 }
 
+// TrackRoutes registers the track routes that start uploads.
+func (h *Handler) TrackRoutes(r chi.Router) {
+	r.Post("/tracks/{id}/replace-audio", h.ReplaceAudio)
+}
+
 type createRequest struct {
+	admin          bool   // set by AdminCreate: an administrator uploads for the release artist
 	ReleaseID      string `json:"releaseId"`
 	Title          string `json:"title"`
 	Genre          string `json:"genre"`
@@ -106,16 +121,29 @@ func (h *Handler) create(w http.ResponseWriter, r *http.Request) {
 		httpx.Error(w, http.StatusBadRequest, "bad_request", "invalid JSON body")
 		return
 	}
+	if resp, ok := h.start(w, r, uid, req); ok {
+		httpx.JSON(w, http.StatusCreated, resp)
+	}
+}
+
+// start validates and reserves an upload and prepares where the file goes. On any problem it writes
+// the HTTP error itself and reports false.
+func (h *Handler) start(w http.ResponseWriter, r *http.Request, uid string, req createRequest) (*createResponse, bool) {
 	req.Title, req.Genre = strings.TrimSpace(req.Title), strings.TrimSpace(req.Genre)
 	req.Filename, req.TermsVersion = strings.TrimSpace(req.Filename), strings.TrimSpace(req.TermsVersion)
 
 	if msg := h.validate(req); msg != "" {
 		httpx.Error(w, http.StatusUnprocessableEntity, "validation_error", msg)
-		return
+		return nil, false
+	}
+	var gerr error
+	if req.Genre, gerr = genre.Normalize(req.Genre); gerr != nil {
+		httpx.Error(w, http.StatusUnprocessableEntity, "invalid_genre", gerr.Error())
+		return nil, false
 	}
 	if !req.RightsAccepted {
 		httpx.Error(w, http.StatusUnprocessableEntity, "rights_not_accepted", "you must confirm that you own the rights to this content")
-		return
+		return nil, false
 	}
 
 	var partSize int64
@@ -123,7 +151,8 @@ func (h *Handler) create(w http.ResponseWriter, r *http.Request) {
 		partSize = h.opt.PartSize
 	}
 	u, err := h.store.Create(r.Context(), NewUpload{
-		UserID: uid, ReleaseID: req.ReleaseID, Title: req.Title, Genre: req.Genre, TrackNumber: req.TrackNumber,
+		AsAdmin: req.admin,
+		UserID:  uid, ReleaseID: req.ReleaseID, Title: req.Title, Genre: req.Genre, TrackNumber: req.TrackNumber,
 		Explicit: req.Explicit, Filename: req.Filename, SizeBytes: req.SizeBytes, TermsVersion: req.TermsVersion,
 		PartSize: partSize,
 	})
@@ -135,23 +164,26 @@ func (h *Handler) create(w http.ResponseWriter, r *http.Request) {
 				"requiredBytes": quota.Required, "remainingBytes": quota.Remaining,
 				"limitBytes": quota.Limit, "usedBytes": quota.Used,
 			})
-		return
+		return nil, false
+	case errors.Is(err, ErrArtistBanned):
+		httpx.Error(w, http.StatusForbidden, "account_banned", "this artist profile has been suspended")
+		return nil, false
 	case errors.Is(err, ErrNoArtist):
 		httpx.Error(w, http.StatusForbidden, "artist_required", "create your artist profile before uploading")
-		return
+		return nil, false
 	case errors.Is(err, ErrReleaseNotFound):
 		httpx.Error(w, http.StatusNotFound, "not_found", "release not found")
-		return
+		return nil, false
 	case errors.Is(err, ErrLimit):
 		httpx.Error(w, http.StatusConflict, "limit_reached", "too many unfinished uploads; wait for them to finish")
-		return
+		return nil, false
 	case errors.Is(err, ErrDailyLimit):
 		w.Header().Set("Retry-After", "3600")
 		httpx.Error(w, http.StatusTooManyRequests, "daily_limit", "daily upload limit reached; request verification to lift it")
-		return
+		return nil, false
 	case err != nil:
 		serverError(w, err)
-		return
+		return nil, false
 	}
 
 	target, err := h.newTarget(r.Context(), u)
@@ -161,9 +193,9 @@ func (h *Handler) create(w http.ResponseWriter, r *http.Request) {
 			h.cleanup(r.Context(), st)
 		}
 		serverError(w, err)
-		return
+		return nil, false
 	}
-	httpx.JSON(w, http.StatusCreated, createResponse{view: toView(u), Upload: *target, MaxBytes: h.opt.MaxBytes})
+	return &createResponse{view: toView(u), Upload: *target, MaxBytes: h.opt.MaxBytes}, true
 }
 
 // newTarget prepares the object store side of a fresh upload.
@@ -353,6 +385,9 @@ func (h *Handler) complete(w http.ResponseWriter, r *http.Request) {
 		serverError(w, err)
 		return
 	}
+	if h.OnAdminComplete != nil && isAdmin(r.Context()) {
+		h.OnAdminComplete(r, u)
+	}
 	httpx.JSON(w, http.StatusAccepted, toView(u))
 }
 
@@ -414,7 +449,13 @@ func (h *Handler) get(w http.ResponseWriter, r *http.Request) {
 // deleting its track.
 func (h *Handler) delete(w http.ResponseWriter, r *http.Request) {
 	uid, _ := auth.UserID(r.Context())
-	st, err := h.store.Delete(r.Context(), chi.URLParam(r, "id"), uid)
+	var st *Stale
+	var err error
+	if isAdmin(r.Context()) {
+		st, err = h.store.DeleteAny(r.Context(), chi.URLParam(r, "id"))
+	} else {
+		st, err = h.store.Delete(r.Context(), chi.URLParam(r, "id"), uid)
+	}
 	switch {
 	case errors.Is(err, ErrNotFound):
 		httpx.Error(w, http.StatusNotFound, "not_found", "upload not found")
@@ -464,7 +505,7 @@ func (h *Handler) list(w http.ResponseWriter, r *http.Request) {
 func (h *Handler) owned(w http.ResponseWriter, r *http.Request) (*Upload, bool) {
 	uid, _ := auth.UserID(r.Context())
 	u, err := h.store.Get(r.Context(), chi.URLParam(r, "id"))
-	if errors.Is(err, ErrNotFound) || (err == nil && u.UserID != uid) {
+	if errors.Is(err, ErrNotFound) || (err == nil && u.UserID != uid && !isAdmin(r.Context())) {
 		httpx.Error(w, http.StatusNotFound, "not_found", "upload not found")
 		return nil, false
 	}
@@ -512,4 +553,120 @@ func toView(u *Upload) view {
 func serverError(w http.ResponseWriter, err error) {
 	slog.Error("upload handler", "err", err)
 	httpx.Error(w, http.StatusInternalServerError, "internal", "something went wrong")
+}
+
+type replaceRequest struct {
+	Filename       string `json:"filename"`
+	SizeBytes      int64  `json:"sizeBytes"`
+	RightsAccepted bool   `json:"rightsAccepted"`
+	TermsVersion   string `json:"termsVersion"`
+}
+
+type replaceResponse struct {
+	createResponse
+	ReplacedTrackID string `json:"replacedTrackId"`
+}
+
+// ReplaceAudio swaps the file of a track that is still in a draft: it starts an upload carrying the
+// old track's title, genre, number and explicit flag into the same release, then removes the old
+// track and its storage. The new upload is reserved first, so a rejected file (too big, over quota,
+// not accepted) leaves the existing track untouched.
+func (h *Handler) ReplaceAudio(w http.ResponseWriter, r *http.Request) {
+	uid, _ := auth.UserID(r.Context())
+	trackID := chi.URLParam(r, "id")
+	var body replaceRequest
+	if err := httpx.Decode(w, r, &body); err != nil {
+		httpx.Error(w, http.StatusBadRequest, "bad_request", "invalid JSON body")
+		return
+	}
+	if h.Tracks == nil {
+		httpx.Error(w, http.StatusNotImplemented, "unavailable", "replacing a file is not available")
+		return
+	}
+	old, err := h.store.DraftTrack(r.Context(), trackID, uid)
+	switch {
+	case errors.Is(err, ErrTrackNotFound):
+		httpx.Error(w, http.StatusNotFound, "not_found", "track not found")
+		return
+	case errors.Is(err, ErrTrackNotDraft):
+		httpx.Error(w, http.StatusConflict, "not_draft", "the file can only be replaced while the release is a draft")
+		return
+	case err != nil:
+		serverError(w, err)
+		return
+	}
+	if _, gerr := genre.Normalize(old.Genre); gerr != nil {
+		old.Genre = "" // an older track may carry a genre that is no longer on the list
+	}
+	resp, ok := h.start(w, r, uid, createRequest{
+		ReleaseID: old.ReleaseID, Title: old.Title, Genre: old.Genre, TrackNumber: old.TrackNumber, Explicit: old.Explicit,
+		Filename: body.Filename, SizeBytes: body.SizeBytes, RightsAccepted: body.RightsAccepted, TermsVersion: body.TermsVersion,
+	})
+	if !ok {
+		return
+	}
+	if err := h.Tracks.DeleteTrack(r.Context(), trackID, uid); err != nil {
+		// Keep what the artist had: give the new reservation back.
+		if st, derr := h.store.Delete(r.Context(), resp.ID, uid); derr == nil {
+			h.cleanup(r.Context(), st)
+		}
+		serverError(w, err)
+		return
+	}
+	httpx.JSON(w, http.StatusCreated, replaceResponse{createResponse: *resp, ReplacedTrackID: trackID})
+}
+
+type adminKey struct{}
+
+// AsAdmin marks the request as made by an administrator, so the routes below accept any upload. Only put it
+// behind the admin check.
+func AsAdmin(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		next.ServeHTTP(w, r.WithContext(context.WithValue(r.Context(), adminKey{}, true)))
+	})
+}
+
+func isAdmin(ctx context.Context) bool {
+	v, _ := ctx.Value(adminKey{}).(bool)
+	return v
+}
+
+// AdminRoutes registers, on the admin router, the routes an administrator uses to follow, resume, finish or
+// cancel any upload:
+//
+//	GET    /{id}            status
+//	GET    /{id}/parts      what arrived of a multipart upload, with fresh URLs for the rest
+//	POST   /{id}/complete
+//	DELETE /{id}
+func (h *Handler) AdminRoutes(r chi.Router) {
+	r.Use(AsAdmin)
+	r.Get("/{id}", h.get)
+	r.Get("/{id}/parts", h.parts)
+	r.Post("/{id}/complete", h.complete)
+	r.Delete("/{id}", h.delete)
+}
+
+// AdminCreateInput describes a file an administrator uploads into a release.
+type AdminCreateInput struct {
+	ReleaseID   string
+	Title       string
+	Genre       string
+	TrackNumber *int
+	Explicit    bool
+	Filename    string
+	SizeBytes   int64
+}
+
+// AdminCreate reserves an upload in any release, with the rights confirmed by the administrator. On success it
+// returns the upload id and a send function that writes the 201 answer (the same body as POST /v1/uploads), so
+// the caller can record its audit row first. On any problem the error answer is already written.
+func (h *Handler) AdminCreate(w http.ResponseWriter, r *http.Request, adminID string, in AdminCreateInput) (id string, send func(), ok bool) {
+	resp, ok := h.start(w, r, adminID, createRequest{
+		admin: true, ReleaseID: in.ReleaseID, Title: in.Title, Genre: in.Genre, TrackNumber: in.TrackNumber, Explicit: in.Explicit,
+		Filename: in.Filename, SizeBytes: in.SizeBytes, RightsAccepted: true, TermsVersion: "admin",
+	})
+	if !ok {
+		return "", nil, false
+	}
+	return resp.ID, func() { httpx.JSON(w, http.StatusCreated, resp) }, true
 }

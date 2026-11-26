@@ -1,0 +1,60 @@
+<h1>Terms of Service</h1>
+<p class="meta">Last updated {{.Updated}}</p>
+
+<p>These terms are an agreement between you and {{.Operator}} ("Blac Music", "we", "us") about your use of the Blac Music app, website and services at <a href="{{.SiteURL}}">{{.SiteURL}}</a> (the "Service"). By creating an account or using the Service you agree to them and to our <a href="/privacy">Privacy Policy</a>. If you do not agree, please do not use the Service.</p>
+
+<h2>1. Your account</h2>
+<ul>
+<li>You must give accurate information and keep your sign-in details safe. You are responsible for what happens under your account.</li>
+<li>You must be old enough to agree to these terms where you live; if you are under 18, you need a parent or guardian's permission.</li>
+<li>You can delete your account at any time in the app (Settings). We may suspend or close an account that breaks these terms or the law.</li>
+</ul>
+
+<h2>2. Listening</h2>
+<p>Music and podcasts on Blac Music are provided for your personal, non-commercial listening. You may not copy, download (except where the app offers it), redistribute, scrape or reverse engineer the content or the Service, or use it to train machine-learning models. Podcast episodes belong to their publishers, and we play them from the publisher's own feed.</p>
+
+<h2>3. Artists and uploaded content</h2>
+<ul>
+<li><strong>You must own or control the rights.</strong> When you upload audio, artwork or other content, you confirm that you own it or have all the permissions needed to publish and stream it on Blac Music, including permission from every songwriter, performer, producer, label and sample owner involved, and that it does not infringe anyone's rights or break the law.</li>
+<li><strong>Your licence to us.</strong> You keep your rights in your content. You give us a worldwide, non-exclusive licence to store, copy, convert (for example to different audio qualities), stream and display your content, and your name and picture, as needed to run the Service for as long as you keep it on Blac Music. The licence ends when you delete the content, except for copies that must remain in backups for a short time or that others have saved in their libraries only as references.</li>
+<li><strong>Importing from YouTube.</strong> If you connect your YouTube channel, we only read information about your videos to help you prepare releases. {{if .AudioFetch}}If you ask us to import a song's audio from your channel, you confirm that you own or control the rights to that song, and that you are allowed to copy it from YouTube; we fetch only audio-only streams of videos of the channel you connected, and you remain responsible for complying with the YouTube Terms of Service. We may switch this feature off at any time, and you can always upload a file yourself.{{else}}You must upload the audio yourself, and you may only do so for songs you have the rights to.{{end}} Using YouTube is also subject to the <a href="https://www.youtube.com/t/terms">YouTube Terms of Service</a>.</li>
+<li><strong>Verification and limits.</strong> We may ask artists to verify their identity or rights. Free accounts have a storage allowance and upload limits that may change. We may remove content that breaks these terms, to protect the Service.</li>
+</ul>
+
+<h2>4. What you must not do</h2>
+<ul>
+<li>Upload or share content that infringes copyright or other rights, or that is unlawful, hateful, abusive, deceptive or sexually explicit involving minors.</li>
+<li>Pretend to be another person or artist, or create accounts to avoid limits or a suspension.</li>
+<li>Interfere with the Service or its security, probe it for weaknesses without our written permission, or overload it.</li>
+<li>Use bots or automated means to stream, to inflate play counts, followers or saves, or to collect data.</li>
+</ul>
+
+<h2>5. Copyright complaints</h2>
+<p>If you believe content on Blac Music infringes your rights, write to us{{if .Email}} at <a href="mailto:{{.Email}}">{{.Email}}</a>{{end}} with: who you are and your rights; the link to the content; why you believe it infringes; and your contact details. We will review it and may remove the content and contact the person who uploaded it. People who repeatedly infringe may lose their accounts.</p>
+
+<h2>6. Payments</h2>
+<p>Listening and the free artist allowance cost nothing. If we offer paid features, such as extra storage, the price, currency and payment method will be shown to you before you buy, and the terms of that purchase will apply as well.</p>
+
+<h2>7. Notifications and messages</h2>
+<p>We may send you messages about your account and the Service, such as verification codes and notifications about your uploads and imports. You can turn notification types off in the app.</p>
+
+<h2>8. Our rights</h2>
+<p>The Service, its software, design and branding belong to us or our licensors. These terms do not give you any right to them except to use the Service as intended. Feedback you give us may be used without payment or obligation.</p>
+
+<h2>9. Availability and changes</h2>
+<p>We work to keep Blac Music available, but it is provided "as is" and "as available". We may change, suspend or stop parts of the Service, and we will try to give notice of changes that significantly affect you.</p>
+
+<h2>10. Limits of our responsibility</h2>
+<p>To the extent the law allows, we are not liable for indirect or consequential loss, lost profits or lost data, and our total liability for any claim about the Service is limited to the amount you paid us in the 12 months before the claim (or, if you paid nothing, to a nominal amount). Nothing in these terms limits liability that cannot be limited by law, and your rights as a consumer are not affected.</p>
+
+<h2>11. Ending</h2>
+<p>You can stop using the Service and delete your account at any time. We may suspend or end your access if you break these terms, if the law requires it, or if we stop providing the Service. Sections that by their nature should continue (for example 3, 5 and 10) continue after the end.</p>
+
+<h2>12. Changes to these terms</h2>
+<p>We may update these terms. If a change is significant we will tell you in the app or by email before it applies. Continuing to use the Service after the change means you accept it.</p>
+
+<h2>13. Governing law</h2>
+<p>These terms are governed by the laws of Uganda, and the courts of Uganda have jurisdiction, without taking away any rights you have under the laws of the place where you live.</p>
+
+<h2>14. Contact</h2>
+<p>{{.Operator}}{{if .Email}}<br>Email: <a href="mailto:{{.Email}}">{{.Email}}</a>{{end}}<br>Website: <a href="{{.SiteURL}}">{{.SiteURL}}</a></p>

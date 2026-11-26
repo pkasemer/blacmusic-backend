@@ -78,6 +78,8 @@ services:
       S3_SECRET_KEY: ${RUSTFS_SECRET_KEY}
       S3_BUCKET: blac-media
       PUBLIC_API_URL: ${PUBLIC_API_URL:?set PUBLIC_API_URL in .env}
+      LEGAL_OPERATOR: ${LEGAL_OPERATOR:-Blac Music}          # named on /privacy and /terms
+      LEGAL_CONTACT_EMAIL: ${LEGAL_CONTACT_EMAIL:-}          # contact address shown on /privacy and /terms
       TRUST_PROXY: "true"            # the port below is reachable only by nginx on this machine
       FREE_STORAGE_GB: ${FREE_STORAGE_GB:-1}
       SMTP_HOST: ${SMTP_HOST:-}
@@ -85,6 +87,23 @@ services:
       SMTP_USER: ${SMTP_USER:-}
       SMTP_PASSWORD: ${SMTP_PASSWORD:-}
       SMTP_FROM: ${SMTP_FROM:-Blac Music <no-reply@blacmusic.pkasemer.com>}
+      PLUNK_API_KEY: ${PLUNK_API_KEY:-}                      # Plunk secret key (sk_...): emails are sent through Plunk when set
+      EDITORIAL_OWNER_EMAIL: ${EDITORIAL_OWNER_EMAIL:-}      # the administrator account that owns the editorial playlists (admin site)
+      ADMIN_SITE_URL: ${ADMIN_SITE_URL:-}                    # bulk import answers link to this admin site; empty leaves links out
+      IMPORT_MAX_TOTAL_MB: ${IMPORT_MAX_TOTAL_MB:-1024}      # all files of one bulk import together
+      IMPORT_MIN_FREE_GB: ${IMPORT_MIN_FREE_GB:-2}           # bulk imports are refused below this much free disk
+      MAIL_FROM: ${MAIL_FROM:-}                              # "Blac Music <no-reply@pkasemer.com>": the domain must be verified in Plunk
+      GOOGLE_CLIENT_ID: ${GOOGLE_CLIENT_ID:-}              # empty keeps YouTube connect off
+      GOOGLE_CLIENT_SECRET: ${GOOGLE_CLIENT_SECRET:-}
+      TOKEN_ENC_KEY: ${TOKEN_ENC_KEY:-}                    # required when GOOGLE_CLIENT_ID is set
+      YOUTUBE_REDIRECT_URL: ${YOUTUBE_REDIRECT_URL:-}
+      YOUTUBE_AUDIO_FETCH: ${YOUTUBE_AUDIO_FETCH:-false}     # true: transfers may import audio from the artist's own YouTube videos
+      YOUTUBE_APP_REDIRECT: ${YOUTUBE_APP_REDIRECT:-blacmusic://youtube/connected}
+      APPLE_BUNDLE_IDS: ${APPLE_BUNDLE_IDS:-com.blac.music,com.blac.music.dev}   # "none" turns Sign in with Apple off
+      GOOGLE_AUTH_CLIENT_ID: ${GOOGLE_AUTH_CLIENT_ID:-}      # empty keeps Sign in with Google off
+      GOOGLE_AUTH_CLIENT_SECRET: ${GOOGLE_AUTH_CLIENT_SECRET:-}
+      GOOGLE_AUTH_REDIRECT_URL: ${GOOGLE_AUTH_REDIRECT_URL:-}
+      GOOGLE_AUTH_APP_REDIRECT: ${GOOGLE_AUTH_APP_REDIRECT:-blacmusic://auth/google}
     ports: ["127.0.0.1:8080:8080"]
     mem_limit: 192m
     logging: *logging
@@ -106,6 +125,17 @@ services:
       S3_BUCKET: blac-media
       PUBLIC_API_URL: ${PUBLIC_API_URL}
       WORKER_CONCURRENCY: "1"
+      TRANSFER_CONCURRENCY: ${TRANSFER_CONCURRENCY:-1}
+      YOUTUBE_AUDIO_FETCH: ${YOUTUBE_AUDIO_FETCH:-false}
+      EXPO_ACCESS_TOKEN: ${EXPO_ACCESS_TOKEN:-}              # optional, only with "enhanced push security" in the Expo project
+      # the worker sends the release emails (published, audio processed): same provider as the API
+      SMTP_HOST: ${SMTP_HOST:-}
+      SMTP_PORT: ${SMTP_PORT:-587}
+      SMTP_USER: ${SMTP_USER:-}
+      SMTP_PASSWORD: ${SMTP_PASSWORD:-}
+      SMTP_FROM: ${SMTP_FROM:-Blac Music <no-reply@blacmusic.pkasemer.com>}
+      PLUNK_API_KEY: ${PLUNK_API_KEY:-}
+      MAIL_FROM: ${MAIL_FROM:-}
     cpus: "0.5"
     mem_limit: 512m
     logging: *logging

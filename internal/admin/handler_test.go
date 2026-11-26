@@ -13,6 +13,9 @@ import (
 
 	"github.com/blacmusic/backend/internal/artist"
 	"github.com/blacmusic/backend/internal/auth"
+	"github.com/blacmusic/backend/internal/importopt"
+	"github.com/blacmusic/backend/internal/playlist"
+	"github.com/blacmusic/backend/internal/showcase"
 	"github.com/blacmusic/backend/internal/testutil"
 )
 
@@ -20,7 +23,9 @@ func setupRouter(t *testing.T) (http.Handler, *artist.Store) {
 	t.Helper()
 	pool := testutil.Pool(t)
 	store := artist.NewStore(pool, 10*testutil.GiB, "http://api.test")
-	h := NewHandler(pool, store)
+	h := NewHandler(pool, store, playlist.NewStore(pool, "http://api.test"))
+	h.Showcase = showcase.NewStore(pool, "http://api.test")
+	h.ImportOptions = importopt.NewHandler(importopt.NewStore(pool))
 	r := chi.NewRouter()
 	r.Group(func(g chi.Router) {
 		g.Use(auth.Require(auth.NewTokenService(testutil.Secret, time.Minute)))
@@ -143,5 +148,109 @@ func TestStorageGrantsAreIdempotent(t *testing.T) {
 	}
 	if code, _ := call(r, "POST", "/admin/artists/art_nope/storage-grants", admin, map[string]any{"kind": "promo", "bytes": 1}); code != 404 {
 		t.Fatalf("unknown artist = %d, want 404", code)
+	}
+}
+
+func TestPlaylistGroupsAdminOnly(t *testing.T) {
+	r, _ := setupRouter(t)
+	pool := testutil.Pool(t)
+	user := testutil.Token(t, testutil.User(t, pool, "user", true))
+	admin := testutil.Token(t, testutil.User(t, pool, "admin", true))
+
+	for _, c := range []struct{ method, path string }{
+		{"GET", "/admin/playlist-groups"},
+		{"POST", "/admin/playlist-groups"},
+		{"PATCH", "/admin/playlist-groups/x"},
+		{"DELETE", "/admin/playlist-groups/x"},
+		{"PUT", "/admin/playlist-groups/x/playlists"},
+	} {
+		if code, _ := call(r, c.method, c.path, user, map[string]any{"title": "x", "playlistIds": []string{}}); code != 403 {
+			t.Errorf("user %s %s = %d, want 403", c.method, c.path, code)
+		}
+	}
+
+	id := testutil.Unique("grp")
+	code, g := call(r, "POST", "/admin/playlist-groups", admin, map[string]any{"id": id, "title": "Workout", "description": "Push it", "position": 8_000_000})
+	if code != 201 || g["id"] != id || g["isActive"] != true || g["description"] != "Push it" {
+		t.Fatalf("create = %d %v", code, g)
+	}
+	t.Cleanup(func() { pool.Exec(context.Background(), `DELETE FROM playlist_groups WHERE id = $1`, id) }) //nolint:errcheck
+	if code, _ = call(r, "POST", "/admin/playlist-groups", admin, map[string]any{"id": id, "title": "again"}); code != 409 {
+		t.Fatalf("duplicate = %d, want 409", code)
+	}
+	if code, _ = call(r, "POST", "/admin/playlist-groups", admin, map[string]any{"title": ""}); code != 422 {
+		t.Fatalf("blank title = %d, want 422", code)
+	}
+	if code, g = call(r, "PATCH", "/admin/playlist-groups/"+id, admin, map[string]any{"isActive": false}); code != 200 || g["isActive"] != false {
+		t.Fatalf("patch = %d %v", code, g)
+	}
+	if code, _ = call(r, "PUT", "/admin/playlist-groups/"+id+"/playlists", admin, map[string]any{"playlistIds": []string{"pl_nope"}}); code != 422 {
+		t.Fatalf("unknown playlist = %d, want 422", code)
+	}
+	if code, _ = call(r, "PUT", "/admin/playlist-groups/"+id+"/playlists", admin, map[string]any{}); code != 400 {
+		t.Fatalf("missing playlistIds = %d, want 400", code)
+	}
+	if code, g = call(r, "PUT", "/admin/playlist-groups/"+id+"/playlists", admin, map[string]any{"playlistIds": []string{}}); code != 200 {
+		t.Fatalf("empty members = %d %v", code, g)
+	}
+	if code, _ = call(r, "PATCH", "/admin/playlist-groups/nope-"+id, admin, map[string]any{"title": "x"}); code != 404 {
+		t.Fatalf("unknown group = %d, want 404", code)
+	}
+	if code, _ = call(r, "DELETE", "/admin/playlist-groups/"+id, admin, nil); code != 204 {
+		t.Fatalf("delete = %d, want 204", code)
+	}
+}
+
+func TestShowcaseAdminOnly(t *testing.T) {
+	r, _ := setupRouter(t)
+	pool := testutil.Pool(t)
+	user := testutil.Token(t, testutil.User(t, pool, "user", true))
+	admin := testutil.Token(t, testutil.User(t, pool, "admin", true))
+	if code, _ := call(r, "GET", "/admin/showcase", user, nil); code != 403 {
+		t.Fatalf("user GET = %d, want 403", code)
+	}
+	if code, _ := call(r, "PUT", "/admin/showcase", user, map[string]any{"items": []any{}}); code != 403 {
+		t.Fatalf("user PUT = %d, want 403", code)
+	}
+	if code, b := call(r, "PUT", "/admin/showcase", admin, map[string]any{}); code != 400 {
+		t.Fatalf("PUT without items = %d %v", code, b)
+	}
+	if code, b := call(r, "PUT", "/admin/showcase", admin, map[string]any{"items": []map[string]string{{"kind": "artist", "id": "art_nope", "consentNote": "agreed"}}}); code != 422 {
+		t.Fatalf("PUT unknown artist = %d %v", code, b)
+	}
+	code, b := call(r, "PUT", "/admin/showcase", admin, map[string]any{"items": []any{}})
+	if code != 200 || b["max"] != float64(12) {
+		t.Fatalf("PUT empty = %d %v", code, b)
+	}
+	pool.Exec(context.Background(), `DELETE FROM showcase_items`) //nolint:errcheck
+}
+
+func TestImportOptionsAdminOnly(t *testing.T) {
+	r, _ := setupRouter(t)
+	pool := testutil.Pool(t)
+	user := testutil.Token(t, testutil.User(t, pool, "user", true))
+	admin := testutil.Token(t, testutil.User(t, pool, "admin", true))
+	id := "t_" + time.Now().Format("150405") + "_adm"
+	t.Cleanup(func() { pool.Exec(context.Background(), `DELETE FROM import_options WHERE id = $1`, id) }) //nolint:errcheck
+
+	if code, _ := call(r, "PUT", "/admin/import-options/"+id, user, map[string]any{"enabled": true}); code != 403 {
+		t.Fatalf("user = %d, want 403", code)
+	}
+	code, b := call(r, "PUT", "/admin/import-options/"+id, admin, map[string]any{"title": "Test option", "note": "Coming soon"})
+	if code != 200 || b["id"] != id || b["enabled"] != false || b["title"] != "Test option" {
+		t.Fatalf("create = %d %v", code, b)
+	}
+	if code, b = call(r, "PUT", "/admin/import-options/"+id, admin, map[string]any{"enabled": true}); code != 200 || b["enabled"] != true || b["note"] != "Coming soon" {
+		t.Fatalf("enable = %d %v", code, b)
+	}
+	if code, b = call(r, "PUT", "/admin/import-options/"+id, admin, map[string]any{}); code != 422 {
+		t.Fatalf("empty = %d %v", code, b)
+	}
+	if code, b = call(r, "PUT", "/admin/import-options/Bad%20Id", admin, map[string]any{"enabled": true}); code != 422 {
+		t.Fatalf("bad id = %d %v", code, b)
+	}
+	code, b = call(r, "GET", "/admin/import-options", admin, nil)
+	if opts, _ := b["options"].([]any); code != 200 || len(opts) < 3 {
+		t.Fatalf("list = %d %v", code, b)
 	}
 }

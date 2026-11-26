@@ -53,7 +53,10 @@ then upload. Full contract: `backend-api-artist-mode.md` in the notes folder.
    order and in parallel. After a dropped connection `GET /v1/uploads/{id}/parts` lists what arrived and gives fresh URLs
    for the rest. `POST /v1/uploads/{id}/complete` checks the parts itself, assembles them (409 `parts_missing` names any
    gap) and queues the file. Everything goes straight to object storage. Quota is reserved up front (402 `quota_exceeded`
-   when it does not fit); a file may not exceed the size it declared.
+   when it does not fit); a file may not exceed the size it declared. While the release is a draft, `DELETE /v1/tracks/{id}`
+   removes a file, and `POST /v1/tracks/{id}/replace-audio` swaps it for another in one call (same title, genre and place).
+   Importing audio from the artist's own YouTube videos exists behind `YOUTUBE_AUDIO_FETCH` but is parked (off): YouTube
+   blocks the server's address, so every song is uploaded by the artist.
 5. The `worker` container probes the file, measures its loudness (EBU R128, stored as `loudnessLufs` / `truePeakDb` for
    volume matching), and transcodes it once into three AAC-LC `.m4a` renditions, then creates the track inside the release:
 
@@ -70,16 +73,28 @@ then upload. Full contract: `backend-api-artist-mode.md` in the notes folder.
 
 Abandoned multipart uploads (and their stored parts) are aborted by the worker after about 90 minutes, or at once when
 the artist cancels. Storage is counted from the original files only. The verified badge is requested with
-`POST /v1/artists/{id}/verification-request` and decided by an admin (`/v1/admin/...`). Make an admin with SQL:
+`POST /v1/artists/{id}/verification-request` and decided by an admin (`/v1/admin/...`). Make an admin with SQL (admins also feature playlists: `PATCH /v1/playlists/{id}` with `{"isFeatured":true}`):
 
 ```powershell
 docker compose exec -T postgres psql -U blac -d blac -c "UPDATE users SET role='admin' WHERE email='you@example.com'"
+```
+
+Editorial playlists (like Spotify's own): register a dedicated account for the team, then create the empty, featured
+playlists owned by it. Safe to re-run; existing ones are kept. The team adds tracks by signing in to that account, and a
+playlist shows under Browse once it has a public track.
+
+```powershell
+docker compose exec -T postgres psql -U blac -d blac -v owner_email=editorial@yourdomain.com -f - < deploy/editorial.sql
 ```
 
 Real email: set `SMTP_HOST`, `SMTP_PORT` (587, STARTTLS), `SMTP_USER`, `SMTP_PASSWORD`, `SMTP_FROM`. Any SMTP provider works
 (Amazon SES, Mailgun, Resend, ...). The API refuses to start outside development without `SMTP_HOST`.
 `PUBLIC_API_URL` is the address apps use to reach the API (used in image links); for the Android emulator set it to
 `http://10.0.2.2:8080`.
+Upload and download links for audio and images are presigned for one exact host. The dev compose stack sets
+`S3_PUBLIC_HOST_FROM_REQUEST=true`, so those links name whatever host the client used to reach the API
+(`localhost`, `10.0.2.2` for the Android emulator, or the PC's LAN address for a phone); nothing to configure when the
+LAN address changes. The flag is refused in production, where `S3_PUBLIC_ENDPOINT` is fixed.
 
 ## Podcasts
 
@@ -138,10 +153,10 @@ Implement `source.Provider`, register it in `cmd/api/main.go`, and add `track_so
 ## Implemented so far
 
 Auth (register, login, refresh, logout, me), search, track lookup, playback resolve, readiness checks,
-playlists (CRUD, ordered items, add/remove/move, private or public), library (liked tracks, saved albums,
+playlists (CRUD, ordered items, add/remove/move, private or public, covers, discovery and search, admin featuring, saving, named Home shelves under `/v1/admin/playlist-groups`), library (liked tracks, saved albums, saved playlists,
 followed artists, bulk `contains` check), creator uploads with low/medium/high transcoding and
 quality-aware playback, podcasts (RSS ingest, subscriptions, resume progress, background refresh), email verification,
-artist profiles with verification requests, releases with draft/schedule/publish, images, storage quota, admin review.
+artist profiles with verification requests, releases with draft/schedule/publish, images, storage quota, admin review. Sign in with Apple and Google (same accounts as email, linked by verified email; `GOOGLE_AUTH_FAKE`/`APPLE_AUTH_FAKE` in development), account deletion (`DELETE /v1/me`), public Privacy Policy and Terms pages (`/privacy`, `/terms`; set `LEGAL_CONTACT_EMAIL`), push notifications through Expo (device tokens, per-user switches, an outbox with batching, receipts and retries; `PUSH_FAKE` in development), a curated signed-out showcase (`GET /v1/showcase`, admin `PUT /v1/admin/showcase` with a consent note per entry), YouTube connect (read-only) with discovery of an artist's songs and a persistent, resumable transfer queue with live progress (`/v1/integrations/youtube`, `/v1/transfers`; the artist supplies the audio, nothing is fetched from YouTube; `YOUTUBE_FAKE=true` in development).
 Not yet: play events and stats, offline downloads, reports and takedowns,
 web billing, podcast discovery directory, new-episode notifications, listen-together, admin UI, album/artist detail endpoints, cover art, upload cleanup of abandoned files.
 

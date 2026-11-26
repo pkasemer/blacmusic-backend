@@ -14,6 +14,7 @@ import (
 	"image/jpeg"
 	_ "image/png" // register the PNG decoder
 	"regexp"
+	"strings"
 
 	xdraw "golang.org/x/image/draw"
 	_ "golang.org/x/image/webp" // register the WebP decoder
@@ -47,6 +48,32 @@ var idRe = regexp.MustCompile(`^img_[0-9a-f]{32}$`)
 // URL is the public link to one stored size of an image.
 func URL(publicBase, id, size string) string {
 	return publicBase + "/v1/media/" + id + "/" + size + ".jpg"
+}
+
+// LargeURL turns the link of a stored medium picture into the link of its large (1280 px) version.
+// It is "" for anything that is not one of our own pictures (an old external link has no large size).
+func LargeURL(mediumURL string) string {
+	if !strings.Contains(mediumURL, "/v1/media/img_") || !strings.HasSuffix(mediumURL, "/"+SizeMedium+".jpg") {
+		return ""
+	}
+	return strings.TrimSuffix(mediumURL, SizeMedium+".jpg") + SizeLarge + ".jpg"
+}
+
+// PersonLargeURL is the large version of a person's avatar, or "" when they have none of our own.
+func PersonLargeURL(publicBase string, avatarID *string) string {
+	if avatarID != nil && *avatarID != "" {
+		return URL(publicBase, *avatarID, SizeLarge)
+	}
+	return ""
+}
+
+// PersonURL is the URL of a person's picture: their avatar when they have one,
+// else the legacy picture stored on old catalog artists, else "".
+func PersonURL(publicBase string, avatarID *string, legacyURL string) string {
+	if avatarID != nil && *avatarID != "" {
+		return URL(publicBase, *avatarID, SizeMedium)
+	}
+	return legacyURL
 }
 
 // Querier is satisfied by *pgxpool.Pool and pgx.Tx.

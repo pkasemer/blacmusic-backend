@@ -15,14 +15,23 @@ import (
 
 	"github.com/blacmusic/backend/internal/auth"
 	"github.com/blacmusic/backend/internal/httpx"
+	"github.com/blacmusic/backend/internal/playlist"
 	"github.com/blacmusic/backend/internal/source"
+	"github.com/blacmusic/backend/internal/trackview"
 )
 
 // Handler serves /v1/me/library/*. All routes require authentication.
-type Handler struct{ pool *pgxpool.Pool }
+type Handler struct {
+	pool      *pgxpool.Pool
+	playlists *playlist.Store
+	// PublicURL builds artist picture links in track lists (set by the server).
+	PublicURL string
+}
 
 // NewHandler creates the handler.
-func NewHandler(pool *pgxpool.Pool) *Handler { return &Handler{pool: pool} }
+func NewHandler(pool *pgxpool.Pool, playlists *playlist.Store) *Handler {
+	return &Handler{pool: pool, playlists: playlists}
+}
 
 // kind describes one library table. Values are compile-time constants only;
 // they are interpolated into SQL.
@@ -40,13 +49,15 @@ var (
 	tracks  = kind{"tracks", "library_tracks", "track_id", "tracks", "e.visibility = 'public'"}
 	albums  = kind{"albums", "library_albums", "album_id", "albums", "e.visibility = 'public'"}
 	artists = kind{"artists", "library_artists", "artist_id", "artists", "true"}
+	// Only public playlists can be saved: a private one is not for others.
+	playlists = kind{"playlists", "library_playlists", "playlist_id", "playlists", "e.is_public"}
 )
 
 const maxContainsIDs = 100
 
 // Routes registers the library routes on r (already authenticated).
 func (h *Handler) Routes(r chi.Router) {
-	for _, k := range []kind{tracks, albums, artists} {
+	for _, k := range []kind{tracks, albums, artists, playlists} {
 		k := k
 		r.Get("/"+k.name+"/contains", h.contains(k))
 		r.Put("/"+k.name+"/{id}", h.add(k))
@@ -55,6 +66,7 @@ func (h *Handler) Routes(r chi.Router) {
 	r.Get("/tracks", h.listTracks)
 	r.Get("/albums", h.listAlbums)
 	r.Get("/artists", h.listArtists)
+	r.Get("/playlists", h.listPlaylists)
 }
 
 func (h *Handler) add(k kind) http.HandlerFunc {
@@ -151,13 +163,9 @@ type savedTrack struct {
 func (h *Handler) listTracks(w http.ResponseWriter, r *http.Request) {
 	uid, _ := auth.UserID(r.Context())
 	limit, offset := page(r)
-	rows, err := h.pool.Query(r.Context(), `
-		SELECT t.id, t.title, COALESCE(a.name, ''), COALESCE(al.title, ''),
-		       t.duration_ms, COALESCE(t.artwork_url, al.artwork_url, ''), l.added_at
-		FROM library_tracks l
-		JOIN tracks t        ON t.id  = l.track_id
-		LEFT JOIN artists a  ON a.id  = t.artist_id
-		LEFT JOIN albums  al ON al.id = t.album_id
+	// the same track shape as search and playlists, plus when it was saved
+	rows, err := h.pool.Query(r.Context(), trackview.Select("l.added_at")+`
+		JOIN library_tracks l ON l.track_id = t.id
 		WHERE l.user_id = $1 AND t.visibility = 'public'
 		ORDER BY l.added_at DESC, t.id
 		LIMIT $2 OFFSET $3`, uid, limit, offset)
@@ -169,7 +177,8 @@ func (h *Handler) listTracks(w http.ResponseWriter, r *http.Request) {
 	out := []savedTrack{}
 	for rows.Next() {
 		var s savedTrack
-		if err := rows.Scan(&s.ID, &s.Title, &s.ArtistName, &s.AlbumTitle, &s.DurationMs, &s.ArtworkURL, &s.AddedAt); err != nil {
+		var err error
+		if s.Track, err = trackview.Scan(rows, h.PublicURL, &s.AddedAt); err != nil {
 			serverError(w, err)
 			return
 		}
@@ -183,18 +192,20 @@ func (h *Handler) listTracks(w http.ResponseWriter, r *http.Request) {
 }
 
 type savedAlbum struct {
-	ID         string    `json:"id"`
-	Title      string    `json:"title"`
-	ArtistName string    `json:"artistName,omitempty"`
-	ArtworkURL string    `json:"artworkUrl,omitempty"`
-	AddedAt    time.Time `json:"addedAt"`
+	ID             string    `json:"id"`
+	Title          string    `json:"title"`
+	ArtistID       string    `json:"artistId,omitempty"`
+	ArtistName     string    `json:"artistName,omitempty"`
+	ArtistVerified bool      `json:"artistVerified"`
+	ArtworkURL     string    `json:"artworkUrl,omitempty"`
+	AddedAt        time.Time `json:"addedAt"`
 }
 
 func (h *Handler) listAlbums(w http.ResponseWriter, r *http.Request) {
 	uid, _ := auth.UserID(r.Context())
 	limit, offset := page(r)
 	rows, err := h.pool.Query(r.Context(), `
-		SELECT al.id, al.title, COALESCE(a.name, ''), COALESCE(al.artwork_url, ''), l.added_at
+		SELECT al.id, al.title, COALESCE(a.id, ''), COALESCE(a.name, ''), COALESCE(a.verification = 'verified', false), COALESCE(al.artwork_url, ''), l.added_at
 		FROM library_albums l
 		JOIN albums al      ON al.id = l.album_id
 		LEFT JOIN artists a ON a.id  = al.artist_id
@@ -209,7 +220,7 @@ func (h *Handler) listAlbums(w http.ResponseWriter, r *http.Request) {
 	out := []savedAlbum{}
 	for rows.Next() {
 		var s savedAlbum
-		if err := rows.Scan(&s.ID, &s.Title, &s.ArtistName, &s.ArtworkURL, &s.AddedAt); err != nil {
+		if err := rows.Scan(&s.ID, &s.Title, &s.ArtistID, &s.ArtistName, &s.ArtistVerified, &s.ArtworkURL, &s.AddedAt); err != nil {
 			serverError(w, err)
 			return
 		}
@@ -226,6 +237,7 @@ type followedArtist struct {
 	ID       string    `json:"id"`
 	Name     string    `json:"name"`
 	ImageURL string    `json:"imageUrl,omitempty"`
+	Verified bool      `json:"verified"`
 	AddedAt  time.Time `json:"addedAt"`
 }
 
@@ -233,10 +245,10 @@ func (h *Handler) listArtists(w http.ResponseWriter, r *http.Request) {
 	uid, _ := auth.UserID(r.Context())
 	limit, offset := page(r)
 	rows, err := h.pool.Query(r.Context(), `
-		SELECT a.id, a.name, COALESCE(a.image_url, ''), l.added_at
+		SELECT a.id, a.name, COALESCE(a.image_url, ''), a.verification = 'verified', l.added_at
 		FROM library_artists l
 		JOIN artists a ON a.id = l.artist_id
-		WHERE l.user_id = $1
+		WHERE l.user_id = $1 AND a.banned_at IS NULL
 		ORDER BY l.added_at DESC, a.id
 		LIMIT $2 OFFSET $3`, uid, limit, offset)
 	if err != nil {
@@ -247,7 +259,7 @@ func (h *Handler) listArtists(w http.ResponseWriter, r *http.Request) {
 	out := []followedArtist{}
 	for rows.Next() {
 		var s followedArtist
-		if err := rows.Scan(&s.ID, &s.Name, &s.ImageURL, &s.AddedAt); err != nil {
+		if err := rows.Scan(&s.ID, &s.Name, &s.ImageURL, &s.Verified, &s.AddedAt); err != nil {
 			serverError(w, err)
 			return
 		}
@@ -258,6 +270,17 @@ func (h *Handler) listArtists(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	httpx.JSON(w, http.StatusOK, map[string]any{"artists": out})
+}
+
+func (h *Handler) listPlaylists(w http.ResponseWriter, r *http.Request) {
+	uid, _ := auth.UserID(r.Context())
+	limit, offset := page(r)
+	ps, err := h.playlists.ListSaved(r.Context(), uid, limit, offset)
+	if err != nil {
+		serverError(w, err)
+		return
+	}
+	httpx.JSON(w, http.StatusOK, map[string]any{"playlists": ps})
 }
 
 func page(r *http.Request) (limit, offset int) {

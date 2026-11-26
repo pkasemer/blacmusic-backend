@@ -53,7 +53,7 @@ func setup(t *testing.T) (*Store, *pgxpool.Pool, string, []string) {
 		pool.Exec(ctx, `DELETE FROM users WHERE id::text = $1`, uid)    //nolint:errcheck
 		pool.Exec(ctx, `DELETE FROM tracks WHERE id = ANY($1)`, tracks) //nolint:errcheck
 	})
-	return NewStore(pool), pool, uid, tracks
+	return NewStore(pool, "http://test"), pool, uid, tracks
 }
 
 func order(t *testing.T, s *Store, id, viewer string) []string {
@@ -239,3 +239,29 @@ func TestConcurrentAddsKeepPositionsContiguous(t *testing.T) {
 }
 
 func ptr(i int) *int { return &i }
+
+func TestPlaylistTotalDuration(t *testing.T) {
+	s, pool, owner, tracks := setup(t)
+	ctx := context.Background()
+	pool.Exec(ctx, `UPDATE tracks SET duration_ms = 200000 WHERE id = $1`, tracks[0]) //nolint:errcheck
+	pool.Exec(ctx, `UPDATE tracks SET duration_ms = 100999 WHERE id = $1`, tracks[1]) //nolint:errcheck
+	pool.Exec(ctx, `UPDATE tracks SET duration_ms = 50000 WHERE id = $1`, tracks[2])  //nolint:errcheck
+	p, err := s.Create(ctx, owner, "Timed", "", true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, id := range tracks[:3] {
+		if _, err := s.AddItem(ctx, p.ID, owner, id, nil); err != nil {
+			t.Fatal(err)
+		}
+	}
+	pool.Exec(ctx, `UPDATE tracks SET visibility = 'draft' WHERE id = $1`, tracks[2]) //nolint:errcheck (the artist took it back to draft)
+	d, err := s.Get(ctx, p.ID, owner, 50, 0)
+	if err != nil || d.TotalDurationSec != 350 {
+		t.Fatalf("for the owner = %v %v, want 350 (every track, summed in ms then cut to seconds)", d, err)
+	}
+	d, err = s.Get(ctx, p.ID, "00000000-0000-0000-0000-000000000000", 50, 0)
+	if err != nil || d.TotalDurationSec != 300 {
+		t.Fatalf("for a listener = %v %v, want 300 (only the playable tracks)", d, err)
+	}
+}

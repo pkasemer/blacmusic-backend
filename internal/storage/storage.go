@@ -6,9 +6,12 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"net"
 	"net/http"
 	"net/url"
+	"regexp"
 	"strconv"
+	"sync"
 	"time"
 
 	"github.com/minio/minio-go/v7"
@@ -28,6 +31,49 @@ type Store struct {
 	public   *minio.Client
 	bucket   string
 	region   string
+
+	// Development only: presign for the host the client used to reach the API.
+	creds      *credentials.Credentials
+	publicPort string
+	publicSSL  bool
+	byHost     sync.Map // host -> *minio.Client
+}
+
+type publicHostKey struct{}
+
+var hostRe = regexp.MustCompile(`^[A-Za-z0-9]([A-Za-z0-9.-]{0,251}[A-Za-z0-9])?$`)
+
+// WithPublicHost makes presigned URLs created with ctx point at host (a bare
+// host name or IP, no port; the configured public port is kept). A presigned
+// URL is signed for one exact host, so a phone on the LAN needs links that
+// name the address it can reach, which differs from "localhost". Invalid hosts
+// are ignored.
+func WithPublicHost(ctx context.Context, host string) context.Context {
+	if !hostRe.MatchString(host) {
+		return ctx
+	}
+	return context.WithValue(ctx, publicHostKey{}, host)
+}
+
+// publicClient returns the client that signs links for ctx.
+func (s *Store) publicClient(ctx context.Context) *minio.Client {
+	host, ok := ctx.Value(publicHostKey{}).(string)
+	if !ok || s.creds == nil {
+		return s.public
+	}
+	endpoint := host
+	if s.publicPort != "" {
+		endpoint = net.JoinHostPort(host, s.publicPort)
+	}
+	if c, ok := s.byHost.Load(endpoint); ok {
+		return c.(*minio.Client)
+	}
+	c, err := minio.New(endpoint, &minio.Options{Creds: s.creds, Secure: s.publicSSL, Region: s.region})
+	if err != nil {
+		return s.public
+	}
+	s.byHost.Store(endpoint, c)
+	return c
 }
 
 // New builds a Store from config. Region is set explicitly so presigning never
@@ -42,7 +88,9 @@ func New(cfg config.Config) (*Store, error) {
 	if err != nil {
 		return nil, fmt.Errorf("storage public client: %w", err)
 	}
-	return &Store{internal: internal, public: public, bucket: cfg.S3Bucket, region: cfg.S3Region}, nil
+	_, port, _ := net.SplitHostPort(cfg.S3PublicEndpoint)
+	return &Store{internal: internal, public: public, bucket: cfg.S3Bucket, region: cfg.S3Region,
+		creds: creds, publicPort: port, publicSSL: cfg.S3PublicUseSSL}, nil
 }
 
 // EnsureBucket creates the media bucket if it does not exist.
@@ -62,7 +110,7 @@ func (s *Store) EnsureBucket(ctx context.Context) error {
 
 // PresignGet returns a time-limited download URL reachable by clients.
 func (s *Store) PresignGet(ctx context.Context, key string, ttl time.Duration) (string, error) {
-	u, err := s.public.PresignedGetObject(ctx, s.bucket, key, ttl, nil)
+	u, err := s.publicClient(ctx).PresignedGetObject(ctx, s.bucket, key, ttl, nil)
 	if err != nil {
 		return "", err
 	}
@@ -78,7 +126,7 @@ func (s *Store) Ping(ctx context.Context) error {
 // PresignPut returns a time-limited upload URL reachable by clients. The client
 // sends the file with a plain HTTP PUT.
 func (s *Store) PresignPut(ctx context.Context, key string, ttl time.Duration) (string, error) {
-	u, err := s.public.PresignedPutObject(ctx, s.bucket, key, ttl)
+	u, err := s.publicClient(ctx).PresignedPutObject(ctx, s.bucket, key, ttl)
 	if err != nil {
 		return "", err
 	}
@@ -152,7 +200,7 @@ func (s *Store) StartMultipart(ctx context.Context, key string) (string, error) 
 // PresignPart returns a time-limited URL the client PUTs one part to.
 func (s *Store) PresignPart(ctx context.Context, key, uploadID string, number int, ttl time.Duration) (string, error) {
 	q := url.Values{"uploadId": {uploadID}, "partNumber": {strconv.Itoa(number)}}
-	u, err := s.public.Presign(ctx, http.MethodPut, s.bucket, key, ttl, q)
+	u, err := s.publicClient(ctx).Presign(ctx, http.MethodPut, s.bucket, key, ttl, q)
 	if err != nil {
 		return "", err
 	}

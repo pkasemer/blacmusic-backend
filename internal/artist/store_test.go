@@ -320,3 +320,57 @@ func TestQuotaLedger(t *testing.T) {
 		t.Fatalf("quota of another artist = %v, want ErrNotFound", err)
 	}
 }
+
+func TestFollowAndTheFollowingFlag(t *testing.T) {
+	e := setup(t)
+	ctx := context.Background()
+	owner := testutil.User(t, e.pool, "user", true)
+	fan := testutil.User(t, e.pool, "user", true)
+	a, err := e.store.Create(ctx, owner, name("Followed"), "")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	got, _ := e.store.Get(ctx, a.ID, fan)
+	if got.Following || got.FollowerCount != 0 {
+		t.Fatalf("before following: %+v", got)
+	}
+	if err := e.store.Follow(ctx, fan, a.ID); err != nil {
+		t.Fatal(err)
+	}
+	if err := e.store.Follow(ctx, fan, a.ID); err != nil { // idempotent
+		t.Fatal(err)
+	}
+	if got, _ = e.store.Get(ctx, a.ID, fan); !got.Following || got.FollowerCount != 1 {
+		t.Fatalf("after following: %+v", got)
+	}
+	// It is personal: someone else, and an anonymous reader, are not following.
+	if other, _ := e.store.Get(ctx, a.ID, owner); other.Following {
+		t.Fatal("following must be per person")
+	}
+	if anon, _ := e.store.Get(ctx, a.ID, ""); anon.Following {
+		t.Fatal("anonymous readers follow nobody")
+	}
+	// It is the same list as the library's followed artists.
+	var n int
+	e.pool.QueryRow(ctx, `SELECT count(*) FROM library_artists WHERE user_id = $1 AND artist_id = $2`, fan, a.ID).Scan(&n) //nolint:errcheck
+	if n != 1 {
+		t.Fatalf("library_artists rows = %d, want 1", n)
+	}
+
+	if err := e.store.Unfollow(ctx, fan, a.ID); err != nil {
+		t.Fatal(err)
+	}
+	if err := e.store.Unfollow(ctx, fan, a.ID); err != nil { // idempotent
+		t.Fatal(err)
+	}
+	if got, _ = e.store.Get(ctx, a.ID, fan); got.Following || got.FollowerCount != 0 {
+		t.Fatalf("after unfollowing: %+v", got)
+	}
+	if err := e.store.Follow(ctx, fan, "art_nope"); !errors.Is(err, ErrNotFound) {
+		t.Fatalf("following an unknown artist = %v, want ErrNotFound", err)
+	}
+	if mine, _ := e.store.GetByOwner(ctx, owner); mine.Following {
+		t.Fatal("GetByOwner: the owner is not following themselves")
+	}
+}

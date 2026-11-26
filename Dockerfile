@@ -8,7 +8,20 @@ RUN --mount=type=cache,target=/go/pkg/mod --mount=type=cache,target=/root/.cache
 
 # Transcoding worker: the only image that carries ffmpeg.
 FROM alpine:3.20 AS worker
-RUN apk add --no-cache ca-certificates tzdata ffmpeg && adduser -D -u 10001 app
+# yt-dlp and a JavaScript runtime are only added when the image is built with --build-arg WITH_YTDLP=1.
+# They serve the parked "import audio from the artist's own YouTube videos" feature (YOUTUBE_AUDIO_FETCH),
+# which is off in production, and they add about 150 MB. YouTube changes often: rebuild to get the latest
+# yt-dlp (or pin one with --build-arg YTDLP_VERSION=...).
+ARG WITH_YTDLP=0
+ARG YTDLP_VERSION=
+RUN apk add --no-cache ca-certificates tzdata ffmpeg \
+ && if [ "$WITH_YTDLP" = "1" ]; then \
+      apk add --no-cache python3 py3-pip nodejs \
+      && python3 -m venv /opt/ytdlp \
+      && /opt/ytdlp/bin/pip install --no-cache-dir "yt-dlp${YTDLP_VERSION:+==$YTDLP_VERSION}" \
+      && ln -s /opt/ytdlp/bin/yt-dlp /usr/local/bin/yt-dlp; \
+    fi \
+ && adduser -D -u 10001 app
 USER app
 COPY --from=build /out/worker /usr/local/bin/worker
 ENTRYPOINT ["/usr/local/bin/worker"]

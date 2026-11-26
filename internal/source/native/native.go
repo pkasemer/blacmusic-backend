@@ -13,6 +13,7 @@ import (
 
 	"github.com/blacmusic/backend/internal/media"
 	"github.com/blacmusic/backend/internal/source"
+	"github.com/blacmusic/backend/internal/trackview"
 )
 
 // Name is the source identifier stored in track_sources.source.
@@ -25,14 +26,15 @@ type Presigner interface {
 
 // Provider serves our own catalog.
 type Provider struct {
-	pool   *pgxpool.Pool
-	signer Presigner
-	ttl    time.Duration
+	pool      *pgxpool.Pool
+	signer    Presigner
+	ttl       time.Duration
+	publicURL string // API base URL, for artist picture links
 }
 
 // New creates the native provider.
-func New(pool *pgxpool.Pool, signer Presigner, urlTTL time.Duration) *Provider {
-	return &Provider{pool: pool, signer: signer, ttl: urlTTL}
+func New(pool *pgxpool.Pool, signer Presigner, urlTTL time.Duration, publicURL string) *Provider {
+	return &Provider{pool: pool, signer: signer, ttl: urlTTL, publicURL: publicURL}
 }
 
 func (p *Provider) Name() string { return Name }
@@ -41,16 +43,9 @@ func (p *Provider) Capabilities() []source.Capability {
 	return []source.Capability{source.CapSearch, source.CapOffline}
 }
 
-const trackSelect = `
-	SELECT t.id, t.title, COALESCE(t.artist_id, ''), COALESCE(a.name, ''), COALESCE(t.album_id, ''), COALESCE(al.title, ''),
-	       t.duration_ms, COALESCE(t.artwork_url, al.artwork_url, ''), t.loudness_lufs, t.true_peak_db
-	FROM tracks t
-	LEFT JOIN artists a  ON a.id  = t.artist_id
-	LEFT JOIN albums  al ON al.id = t.album_id`
-
 func (p *Provider) Search(ctx context.Context, query string, limit, offset int) ([]source.Track, error) {
 	pattern := "%" + escapeLike(query) + "%"
-	rows, err := p.pool.Query(ctx, trackSelect+`
+	rows, err := p.pool.Query(ctx, trackview.Select("")+`
 		WHERE t.visibility = 'public'
 		  AND EXISTS (SELECT 1 FROM track_sources ts WHERE ts.track_id = t.id AND ts.source = 'native')
 		  AND (t.title ILIKE $1 OR a.name ILIKE $1)
@@ -63,27 +58,23 @@ func (p *Provider) Search(ctx context.Context, query string, limit, offset int) 
 
 	tracks := []source.Track{}
 	for rows.Next() {
-		var t source.Track
-		if err := rows.Scan(&t.ID, &t.Title, &t.ArtistID, &t.ArtistName, &t.AlbumID, &t.AlbumTitle, &t.DurationMs, &t.ArtworkURL, &t.LoudnessLufs, &t.TruePeakDb); err != nil {
+		t, err := trackview.Scan(rows, p.publicURL)
+		if err != nil {
 			return nil, err
 		}
-		t.Source, t.SourceID = Name, t.ID
 		tracks = append(tracks, t)
 	}
 	return tracks, rows.Err()
 }
 
 func (p *Provider) GetTrack(ctx context.Context, sourceID string) (*source.Track, error) {
-	var t source.Track
-	err := p.pool.QueryRow(ctx, trackSelect+` WHERE t.id = $1`, sourceID).
-		Scan(&t.ID, &t.Title, &t.ArtistID, &t.ArtistName, &t.AlbumID, &t.AlbumTitle, &t.DurationMs, &t.ArtworkURL, &t.LoudnessLufs, &t.TruePeakDb)
+	t, err := trackview.Scan(p.pool.QueryRow(ctx, trackview.Select("")+` WHERE t.id = $1`, sourceID), p.publicURL)
 	if errors.Is(err, pgx.ErrNoRows) {
 		return nil, source.ErrNotFound
 	}
 	if err != nil {
 		return nil, err
 	}
-	t.Source, t.SourceID = Name, t.ID
 	return &t, nil
 }
 

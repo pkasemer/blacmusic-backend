@@ -52,29 +52,36 @@ type Artist struct {
 	Name          string `json:"name"`
 	Bio           string `json:"bio,omitempty"`
 	ImageURL      string `json:"imageUrl,omitempty"`
+	ImageLargeURL string `json:"imageLargeUrl,omitempty"` // the picture at about 1280 px
 	Verified      bool   `json:"verified"`
 	FollowerCount int    `json:"followerCount"`
 	ReleaseCount  int    `json:"releaseCount"` // public releases
 
+	// Following is whether the person asking follows this artist.
+	Following bool `json:"following"`
+
 	// Visible to the owner only.
 	Mine             bool   `json:"mine,omitempty"`
+	Banned           bool   `json:"banned,omitempty"`       // an administrator suspended this profile
 	Verification     string `json:"verification,omitempty"` // unverified | pending | verified | rejected
 	VerificationNote string `json:"verificationNote,omitempty"`
 }
 
 const artistSelect = `
-	SELECT a.id, a.name, a.bio, a.avatar_image_id, COALESCE(a.image_url, ''), a.verification, a.verification_note,
+	SELECT a.id, a.name, a.bio, COALESCE(u.avatar_image_id, a.avatar_image_id), COALESCE(a.image_url, ''), a.verification, a.verification_note,
 	       COALESCE(a.owner_user_id::text, ''),
 	       (SELECT count(*) FROM library_artists l WHERE l.artist_id = a.id),
-	       (SELECT count(*) FROM albums al WHERE al.artist_id = a.id AND al.visibility = 'public')
-	FROM artists a`
+	       (SELECT count(*) FROM albums al WHERE al.artist_id = a.id AND al.visibility = 'public'),
+	       a.banned_at IS NOT NULL
+	FROM artists a LEFT JOIN users u ON u.id = a.owner_user_id`
 
 func (s *Store) scan(row pgx.Row, viewer string) (*Artist, error) {
 	var a Artist
 	var avatarID *string
 	var legacyURL, owner string
+	var banned bool
 	err := row.Scan(&a.ID, &a.Name, &a.Bio, &avatarID, &legacyURL, &a.Verification, &a.VerificationNote, &owner,
-		&a.FollowerCount, &a.ReleaseCount)
+		&a.FollowerCount, &a.ReleaseCount, &banned)
 	if errors.Is(err, pgx.ErrNoRows) {
 		return nil, ErrNotFound
 	}
@@ -82,13 +89,17 @@ func (s *Store) scan(row pgx.Row, viewer string) (*Artist, error) {
 		return nil, err
 	}
 	a.Verified = a.Verification == "verified"
-	a.ImageURL = legacyURL
-	if avatarID != nil {
-		a.ImageURL = image.URL(s.publicURL, *avatarID, image.SizeMedium)
-	}
+	// An artist's picture is the owner's profile picture (one picture for the
+	// person); only old catalog artists without an account use a stored URL.
+	a.ImageURL = image.PersonURL(s.publicURL, avatarID, legacyURL)
+	a.ImageLargeURL = image.PersonLargeURL(s.publicURL, avatarID)
 	if viewer != "" && owner == viewer {
 		a.Mine = true
+		a.Banned = banned
 	} else {
+		if banned {
+			return nil, ErrNotFound // a suspended profile is gone for everyone but its owner
+		}
 		a.Verification, a.VerificationNote = "", "" // only the owner sees the workflow state
 	}
 	return &a, nil
@@ -96,12 +107,46 @@ func (s *Store) scan(row pgx.Row, viewer string) (*Artist, error) {
 
 // Get returns an artist as seen by viewer (viewer may be empty).
 func (s *Store) Get(ctx context.Context, id, viewer string) (*Artist, error) {
-	return s.scan(s.pool.QueryRow(ctx, artistSelect+` WHERE a.id = $1`, id), viewer)
+	a, err := s.scan(s.pool.QueryRow(ctx, artistSelect+` WHERE a.id = $1`, id), viewer)
+	if err != nil {
+		return nil, err
+	}
+	return a, s.markFollowing(ctx, a, viewer)
 }
 
 // GetByOwner returns the user's own artist profile.
 func (s *Store) GetByOwner(ctx context.Context, userID string) (*Artist, error) {
-	return s.scan(s.pool.QueryRow(ctx, artistSelect+` WHERE a.owner_user_id = $1`, userID), userID)
+	a, err := s.scan(s.pool.QueryRow(ctx, artistSelect+` WHERE a.owner_user_id = $1`, userID), userID)
+	if err != nil {
+		return nil, err
+	}
+	return a, s.markFollowing(ctx, a, userID)
+}
+
+func (s *Store) markFollowing(ctx context.Context, a *Artist, viewer string) error {
+	if viewer == "" {
+		return nil
+	}
+	return s.pool.QueryRow(ctx,
+		`SELECT EXISTS (SELECT 1 FROM library_artists WHERE user_id = $1 AND artist_id = $2)`, viewer, a.ID).Scan(&a.Following)
+}
+
+// Follow adds the artist to the user's followed artists (the same list as
+// PUT /v1/me/library/artists/{id}). Following twice is fine.
+func (s *Store) Follow(ctx context.Context, userID, artistID string) error {
+	_, err := s.pool.Exec(ctx,
+		`INSERT INTO library_artists (user_id, artist_id) VALUES ($1, $2) ON CONFLICT DO NOTHING`, userID, artistID)
+	var pgErr *pgconn.PgError
+	if errors.As(err, &pgErr) && pgErr.Code == "23503" {
+		return ErrNotFound
+	}
+	return err
+}
+
+// Unfollow removes the artist from the user's followed artists (idempotent).
+func (s *Store) Unfollow(ctx context.Context, userID, artistID string) error {
+	_, err := s.pool.Exec(ctx, `DELETE FROM library_artists WHERE user_id = $1 AND artist_id = $2`, userID, artistID)
+	return err
 }
 
 // IDByOwner returns the id of the user's artist profile, or ErrNotFound.
@@ -180,9 +225,8 @@ func (s *Store) Update(ctx context.Context, id, userID string, p Patch) (*Artist
 	defer tx.Rollback(ctx) //nolint:errcheck
 
 	var name, bio, verification string
-	var avatar *string
-	err = tx.QueryRow(ctx, `SELECT name, bio, avatar_image_id, verification FROM artists
-		WHERE id = $1 AND owner_user_id = $2 FOR UPDATE`, id, userID).Scan(&name, &bio, &avatar, &verification)
+	err = tx.QueryRow(ctx, `SELECT name, bio, verification FROM artists
+		WHERE id = $1 AND owner_user_id = $2 FOR UPDATE`, id, userID).Scan(&name, &bio, &verification)
 	if errors.Is(err, pgx.ErrNoRows) {
 		return nil, ErrNotFound
 	}
@@ -206,24 +250,28 @@ func (s *Store) Update(ctx context.Context, id, userID string, p Patch) (*Artist
 		}
 		bio = b
 	}
+	// Kept for older clients: the artist picture IS the user's profile picture,
+	// so this sets the user's avatar (same as PATCH /v1/me).
 	if p.AvatarImageID != nil {
-		if *p.AvatarImageID == "" {
-			avatar = nil
-		} else {
+		var newAvatar *string
+		if *p.AvatarImageID != "" {
 			if err := image.CheckOwned(ctx, tx, *p.AvatarImageID, userID, "avatar"); err != nil {
 				return nil, &ValidationError{"avatarImageId must be one of your finished avatar images"}
 			}
-			avatar = p.AvatarImageID
+			newAvatar = p.AvatarImageID
+		}
+		if _, err := tx.Exec(ctx, `UPDATE users SET avatar_image_id = $2 WHERE id = $1`, userID, newAvatar); err != nil {
+			return nil, err
 		}
 	}
 	if renamed && verification == "verified" {
 		verification = "unverified"
 	}
 	if _, err := tx.Exec(ctx, `
-		UPDATE artists SET name = $2, bio = $3, avatar_image_id = $4, verification = $5, updated_at = now(),
-		       flagged = CASE WHEN $6 THEN EXISTS (SELECT 1 FROM artists v WHERE v.verification = 'verified'
+		UPDATE artists SET name = $2, bio = $3, verification = $4, updated_at = now(),
+		       flagged = CASE WHEN $5 THEN EXISTS (SELECT 1 FROM artists v WHERE v.verification = 'verified'
 		                                           AND lower(v.name) = lower($2) AND v.id <> $1) ELSE flagged END
-		WHERE id = $1`, id, name, bio, avatar, verification, renamed); err != nil {
+		WHERE id = $1`, id, name, bio, verification, renamed); err != nil {
 		return nil, err
 	}
 	if err := tx.Commit(ctx); err != nil {

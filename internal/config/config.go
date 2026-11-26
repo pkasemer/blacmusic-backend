@@ -2,6 +2,7 @@
 package config
 
 import (
+	"encoding/hex"
 	"fmt"
 	"os"
 	"strconv"
@@ -46,6 +47,11 @@ type Config struct {
 	FFmpegPath         string
 	FFprobePath        string
 
+	// S3PublicHostFromRequest (development only) presigns storage links for the
+	// host the client used to reach the API, so a phone on the LAN gets links
+	// it can open. Refused in production.
+	S3PublicHostFromRequest bool
+
 	// TrustProxy makes the API believe X-Real-IP / X-Forwarded-For. Enable it only
 	// when every request comes through a reverse proxy that overwrites those
 	// headers (the API port must not be reachable any other way), otherwise
@@ -60,11 +66,58 @@ type Config struct {
 	SMTPUser         string
 	SMTPPassword     string
 	SMTPFrom         string
+	// Plunk (https://www.useplunk.com): sends the emails through its API when PLUNK_API_KEY is set.
+	PlunkAPIKey string // secret key, starts with sk_
+	PlunkURL    string // API base URL; empty means Plunk's own
+	// EditorialOwnerEmail is the administrator account that owns the editorial playlists the admin site edits.
+	EditorialOwnerEmail string
+	MailFrom            string // "Name <address>" the emails come from; the address's domain must be verified at the provider
 
 	// Podcast feeds.
 	FeedAllowPrivate    bool          // dev only: let feed fetches reach private addresses
 	FeedRefreshInterval time.Duration // how often subscribed shows are re-fetched
 	FeedFetchTimeout    time.Duration
+
+	// YouTube connect and transfers. The connect feature is off unless
+	// GOOGLE_CLIENT_ID is set (or YOUTUBE_FAKE is on in development).
+	GoogleClientID      string
+	GoogleClientSecret  string
+	YouTubeRedirectURL  string // where Google sends the browser back to; must match the OAuth client
+	YouTubeAppRedirect  string // where the browser goes after connecting (the app's deep link)
+	TokenEncKey         []byte // 32 bytes; encrypts stored OAuth tokens
+	YouTubeFake         bool   // dev only: a built-in fake YouTube so the flow works without Google
+	TransferConcurrency int    // how many transfers are worked on at once
+
+	// Automatic audio import from the artist's own YouTube videos with yt-dlp. Off unless YOUTUBE_AUDIO_FETCH=true.
+	// It is separate from the YouTube Data API connection: it downloads the audio-only stream.
+	YoutubeAudioFetch bool
+	YtdlpPath         string
+	YtdlpJSRuntime    string        // "node": YouTube's player needs a JavaScript runtime
+	YtdlpMaxBytes     int64         // largest audio file accepted
+	YtdlpMaxDuration  time.Duration // longest video accepted
+	YtdlpTimeout      time.Duration
+
+	// Sign in with Apple / Google.
+	AppleBundleIDs        []string // app ids whose Apple identity tokens are accepted; empty turns Apple sign-in off
+	AppleAuthFake         bool     // dev only: accept "fake:<id>:<email>" as an Apple identity token
+	GoogleAuthClientID    string   // OAuth client (web application) for sign-in; defaults to GOOGLE_CLIENT_ID
+	GoogleAuthSecret      string
+	GoogleAuthRedirectURL string // Google sends the browser back here
+	GoogleAuthAppRedirect string // where the browser goes next: the app's deep link
+	GoogleAuthFake        bool   // dev only: a built-in fake Google
+
+	// Push notifications through Expo.
+	ExpoAccessToken string // optional; needed only when "enhanced push security" is on for the Expo project
+	PushFake        bool   // dev only: send nothing, keep the messages readable at GET /v1/dev/push-outbox
+
+	// The Privacy Policy and Terms pages.
+	LegalOperator string // who runs the service, as the pages name it
+	LegalEmail    string // contact address shown on the pages
+
+	// Bulk catalogue import (API only).
+	AdminSiteURL        string // base URL of the admin site, for links in import answers; empty leaves them out
+	ImportMaxTotalBytes int64  // all files of one import together
+	ImportMinFreeBytes  int64  // an import is refused if it would leave less free disk than this; 0 turns the check off
 }
 
 // Load reads the environment and validates it for the API.
@@ -168,6 +221,12 @@ func load(needJWT bool) (Config, error) {
 		return c, fmt.Errorf("WORKER_CONCURRENCY must be 1-16")
 	}
 
+	if c.S3PublicHostFromRequest, err = getBool("S3_PUBLIC_HOST_FROM_REQUEST", false); err != nil {
+		return c, err
+	}
+	if c.S3PublicHostFromRequest && c.Env == "production" {
+		return c, fmt.Errorf("S3_PUBLIC_HOST_FROM_REQUEST must not be enabled in production")
+	}
 	if c.TrustProxy, err = getBool("TRUST_PROXY", false); err != nil {
 		return c, err
 	}
@@ -187,14 +246,118 @@ func load(needJWT bool) (Config, error) {
 		return c, err
 	}
 
+	c.GoogleClientID = os.Getenv("GOOGLE_CLIENT_ID")
+	c.GoogleClientSecret = os.Getenv("GOOGLE_CLIENT_SECRET")
+	c.YouTubeRedirectURL = get("YOUTUBE_REDIRECT_URL", c.PublicAPIURL+"/v1/integrations/youtube/callback")
+	c.YouTubeAppRedirect = get("YOUTUBE_APP_REDIRECT", "blacmusic://youtube/connected")
+	if c.YouTubeFake, err = getBool("YOUTUBE_FAKE", false); err != nil {
+		return c, err
+	}
+	if c.YouTubeFake && c.Env == "production" {
+		return c, fmt.Errorf("YOUTUBE_FAKE must not be enabled in production")
+	}
+	if c.TransferConcurrency, err = getInt("TRANSFER_CONCURRENCY", 1); err != nil {
+		return c, err
+	}
+	if c.TransferConcurrency < 1 || c.TransferConcurrency > 8 {
+		return c, fmt.Errorf("TRANSFER_CONCURRENCY must be 1-8")
+	}
+	if c.YoutubeAudioFetch, err = getBool("YOUTUBE_AUDIO_FETCH", false); err != nil {
+		return c, err
+	}
+	c.YtdlpPath = get("YTDLP_PATH", "yt-dlp")
+	c.YtdlpJSRuntime = get("YTDLP_JS_RUNTIME", "node")
+	maxMB, err := getInt("YTDLP_MAX_MB", 150)
+	if err != nil {
+		return c, err
+	}
+	if maxMB < 1 || maxMB > 2048 {
+		return c, fmt.Errorf("YTDLP_MAX_MB must be 1-2048")
+	}
+	c.YtdlpMaxBytes = int64(maxMB) << 20
+	if c.YtdlpMaxDuration, err = getDuration("YTDLP_MAX_DURATION", 20*time.Minute); err != nil {
+		return c, err
+	}
+	if c.YtdlpTimeout, err = getDuration("YTDLP_TIMEOUT", 8*time.Minute); err != nil {
+		return c, err
+	}
+	c.AppleBundleIDs = nil
+	if ids := get("APPLE_BUNDLE_IDS", "com.blac.music,com.blac.music.dev"); ids != "none" {
+		for _, id := range strings.Split(ids, ",") {
+			if id = strings.TrimSpace(id); id != "" {
+				c.AppleBundleIDs = append(c.AppleBundleIDs, id)
+			}
+		}
+	}
+	if c.AppleAuthFake, err = getBool("APPLE_AUTH_FAKE", false); err != nil {
+		return c, err
+	}
+	c.GoogleAuthClientID = get("GOOGLE_AUTH_CLIENT_ID", c.GoogleClientID)
+	c.GoogleAuthSecret = get("GOOGLE_AUTH_CLIENT_SECRET", c.GoogleClientSecret)
+	c.GoogleAuthRedirectURL = get("GOOGLE_AUTH_REDIRECT_URL", c.PublicAPIURL+"/v1/auth/google/callback")
+	c.GoogleAuthAppRedirect = get("GOOGLE_AUTH_APP_REDIRECT", "blacmusic://auth/google")
+	if c.GoogleAuthFake, err = getBool("GOOGLE_AUTH_FAKE", false); err != nil {
+		return c, err
+	}
+	c.ExpoAccessToken = os.Getenv("EXPO_ACCESS_TOKEN")
+	c.PlunkAPIKey = os.Getenv("PLUNK_API_KEY")
+	c.PlunkURL = os.Getenv("PLUNK_API_URL")
+	c.EditorialOwnerEmail = strings.TrimSpace(os.Getenv("EDITORIAL_OWNER_EMAIL"))
+	c.MailFrom = get("MAIL_FROM", c.SMTPFrom)
+	c.LegalOperator = get("LEGAL_OPERATOR", "Blac Music")
+	c.LegalEmail = os.Getenv("LEGAL_CONTACT_EMAIL")
+	if c.PushFake, err = getBool("PUSH_FAKE", false); err != nil {
+		return c, err
+	}
+	if c.PushFake && c.Env == "production" {
+		return c, fmt.Errorf("PUSH_FAKE must not be enabled in production")
+	}
+	if (c.AppleAuthFake || c.GoogleAuthFake) && c.Env == "production" {
+		return c, fmt.Errorf("APPLE_AUTH_FAKE and GOOGLE_AUTH_FAKE must not be enabled in production")
+	}
+	if k := os.Getenv("TOKEN_ENC_KEY"); k != "" {
+		raw, derr := hex.DecodeString(k)
+		if derr != nil || len(raw) != 32 {
+			return c, fmt.Errorf("TOKEN_ENC_KEY must be 64 hex characters (32 bytes)")
+		}
+		c.TokenEncKey = raw
+	}
+
+	c.AdminSiteURL = strings.TrimRight(strings.TrimSpace(os.Getenv("ADMIN_SITE_URL")), "/")
+	importMB, err := getInt("IMPORT_MAX_TOTAL_MB", 1024)
+	if err != nil {
+		return c, err
+	}
+	if importMB < 1 {
+		return c, fmt.Errorf("IMPORT_MAX_TOTAL_MB must be at least 1")
+	}
+	c.ImportMaxTotalBytes = int64(importMB) << 20
+	minFreeGB, err := getInt("IMPORT_MIN_FREE_GB", 2)
+	if err != nil {
+		return c, err
+	}
+	if minFreeGB < 0 {
+		return c, fmt.Errorf("IMPORT_MIN_FREE_GB must not be negative")
+	}
+	c.ImportMinFreeBytes = int64(minFreeGB) << 30
+
 	if !needJWT {
 		return c, nil
+	}
+	if c.GoogleAuthClientID != "" && c.GoogleAuthSecret == "" {
+		return c, fmt.Errorf("GOOGLE_AUTH_CLIENT_SECRET (or GOOGLE_CLIENT_SECRET) must be set with the client id")
+	}
+	if c.GoogleClientID != "" && c.GoogleClientSecret == "" {
+		return c, fmt.Errorf("GOOGLE_CLIENT_SECRET must be set with GOOGLE_CLIENT_ID")
+	}
+	if c.GoogleClientID != "" && c.Env == "production" && c.TokenEncKey == nil {
+		return c, fmt.Errorf("TOKEN_ENC_KEY must be set in production when YouTube connect is enabled")
 	}
 	if c.JWTSecret == "" && c.Env == "development" {
 		c.JWTSecret = devJWTSecret
 	}
-	if c.Env == "production" && c.SMTPHost == "" {
-		return c, fmt.Errorf("SMTP_HOST must be set in production (verification emails cannot be sent otherwise)")
+	if c.Env == "production" && c.SMTPHost == "" && c.PlunkAPIKey == "" {
+		return c, fmt.Errorf("PLUNK_API_KEY or SMTP_HOST must be set in production (verification emails cannot be sent otherwise)")
 	}
 	if len(c.JWTSecret) < 32 {
 		return c, fmt.Errorf("JWT_SECRET must be set and at least 32 characters")

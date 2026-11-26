@@ -1,0 +1,241 @@
+{
+  "_note": "Built from Akeine's public YouTube channel (titles and upload dates only). Release dates are the upload date of the earliest video of each song, so they are approximate; genres and the EP track list are guesses. Confirm them with the artist before running with --apply. Audio comes from each track's youtubeId (the best official upload of the song), downloaded into the audio folder under the file names below; replace a file with a master whenever one is available.",
+  "artist": {
+    "name": "Akeine",
+    "bio": "Ugandan singer and songwriter.",
+    "avatar": "akeine.jpg"
+  },
+  "releases": [
+    {
+      "key": "blessed",
+      "type": "single",
+      "title": "Blessed",
+      "genre": "Afropop",
+      "releaseDate": "2026-08-28",
+      "cover": "covers/blessed.jpg",
+      "tracks": [
+        {
+          "title": "Blessed",
+          "file": "blessed.m4a",
+          "youtubeId": "1EhDNCVXVxw"
+        }
+      ],
+      "youtube": [
+        "1EhDNCVXVxw"
+      ]
+    },
+    {
+      "key": "mukene",
+      "type": "single",
+      "title": "Mukene",
+      "genre": "Dancehall",
+      "releaseDate": "2025-06-20",
+      "cover": "covers/mukene.jpg",
+      "tracks": [
+        {
+          "title": "Mukene (feat. Artin Pro)",
+          "file": "mukene.m4a",
+          "youtubeId": "dUAahvAol_k"
+        }
+      ],
+      "youtube": [
+        "dUAahvAol_k",
+        "9gIPvNupz6s",
+        "Ur-LzbbY4l8",
+        "AGB183Z5DxQ",
+        "SKPP8LEPqCI"
+      ],
+      "dedupe": "one song: audio, official video, lyric videos and shorts on the channel"
+    },
+    {
+      "key": "one-thang",
+      "type": "single",
+      "title": "One Thang",
+      "genre": "Afropop",
+      "releaseDate": "2023-10-18",
+      "cover": "covers/one-thang.jpg",
+      "tracks": [
+        {
+          "title": "One Thang",
+          "file": "one-thang.m4a",
+          "youtubeId": "IznIarvvPsc"
+        }
+      ],
+      "youtube": [
+        "BTW6N2-6xi4",
+        "IznIarvvPsc",
+        "q7aVtDSYPFY"
+      ]
+    },
+    {
+      "key": "bomboclat-boi",
+      "type": "single",
+      "title": "Bomboclat Boi",
+      "genre": "Dancehall",
+      "releaseDate": "2023-07-31",
+      "cover": "covers/bomboclat-boi.jpg",
+      "tracks": [
+        {
+          "title": "Bomboclat Boi (feat. Lamu & Navio)",
+          "file": "bomboclat-boi.m4a",
+          "youtubeId": "Af-4GesdgZM"
+        }
+      ],
+      "youtube": [
+        "Af-4GesdgZM"
+      ]
+    },
+    {
+      "key": "better",
+      "type": "single",
+      "title": "Better",
+      "genre": "Afropop",
+      "releaseDate": "2023-04-14",
+      "cover": "covers/better.jpg",
+      "tracks": [
+        {
+          "title": "Better (feat. Wana Benjamin)",
+          "file": "better.m4a",
+          "youtubeId": "EI2yJx5izTY"
+        }
+      ],
+      "youtube": [
+        "EI2yJx5izTY"
+      ]
+    },
+    {
+      "key": "saving-my-love",
+      "type": "single",
+      "title": "Saving My Love",
+      "genre": "R&B/Soul",
+      "releaseDate": "2023-02-10",
+      "cover": "covers/saving-my-love.jpg",
+      "tracks": [
+        {
+          "title": "Saving My Love (feat. Kohen Jaycee)",
+          "file": "saving-my-love.m4a",
+          "youtubeId": "VWyh-RE2e8g"
+        }
+      ],
+      "youtube": [
+        "VWyh-RE2e8g"
+      ]
+    },
+    {
+      "key": "untold",
+      "type": "single",
+      "title": "Untold",
+      "genre": "Afropop",
+      "releaseDate": "2022-12-30",
+      "cover": "covers/untold.jpg",
+      "tracks": [
+        {
+          "title": "Untold (with Andy Muzic)",
+          "file": "untold.m4a",
+          "youtubeId": "ob4Z8IPmpME"
+        }
+      ],
+      "youtube": [
+        "ob4Z8IPmpME"
+      ]
+    },
+    {
+      "key": "onina",
+      "type": "single",
+      "title": "Onina",
+      "genre": "Afropop",
+      "releaseDate": "2022-08-01",
+      "cover": "covers/onina.jpg",
+      "tracks": [
+        {
+          "title": "Onina (with Axon, feat. Gideon Roots)",
+          "file": "onina.m4a",
+          "youtubeId": "4B24VsuyOYI"
+        }
+      ],
+      "youtube": [
+        "4B24VsuyOYI"
+      ]
+    },
+    {
+      "key": "niwe-akeine",
+      "type": "album",
+      "title": "Niwe Akeine",
+      "genre": "Afropop",
+      "releaseDate": "2022-02-17",
+      "description": "The EP with Axon.",
+      "cover": "covers/niwe-akeine.jpg",
+      "tracks": [
+        {
+          "title": "Correct (with Axon)",
+          "file": "niwe-akeine/01-correct.m4a",
+          "youtubeId": "F7vkz5DYmx8"
+        },
+        {
+          "title": "Uninspired (with Axon, feat. Lagum the Rapper)",
+          "file": "niwe-akeine/02-uninspired.m4a",
+          "youtubeId": "FSal0Q2LIPI"
+        },
+        {
+          "title": "Tingatsiga (with Axon, feat. Ssebo Lule)",
+          "file": "niwe-akeine/03-tingatsiga.m4a",
+          "youtubeId": "udI8avmxzHc"
+        }
+      ],
+      "youtube": [
+        "F7vkz5DYmx8",
+        "YRkaJ7-FBTA",
+        "FSal0Q2LIPI",
+        "udI8avmxzHc"
+      ],
+      "note": "Track list and order are from the lyric videos only; the EP may have more songs."
+    },
+    {
+      "key": "mpumuza",
+      "type": "single",
+      "title": "Mpumuza",
+      "genre": "Afropop",
+      "releaseDate": "2020-08-26",
+      "cover": "covers/mpumuza.jpg",
+      "tracks": [
+        {
+          "title": "Mpumuza (with Chxf Barry, feat. Cxnrvd)",
+          "file": "mpumuza.m4a",
+          "youtubeId": "Mv_WEX2GE1E"
+        }
+      ],
+      "youtube": [
+        "Mv_WEX2GE1E",
+        "eOIDcIGHDzw"
+      ]
+    },
+    {
+      "key": "wanted",
+      "type": "single",
+      "title": "Wanted",
+      "genre": "Afropop",
+      "releaseDate": "2020-02-17",
+      "cover": "covers/wanted.jpg",
+      "tracks": [
+        {
+          "title": "Wanted",
+          "file": "wanted.m4a",
+          "youtubeId": "gLrvT_PX8AQ"
+        }
+      ],
+      "youtube": [
+        "gLrvT_PX8AQ"
+      ]
+    }
+  ],
+  "excluded": [
+    {
+      "youtube": "7k5QfmR7oPk",
+      "why": "a live mash-up of Correct, Uninspired and Tingatsiga, not a separate song"
+    },
+    {
+      "youtube": "mlk-Fge6C78",
+      "why": "behind-the-scenes clip for another artist's EP"
+    }
+  ]
+}

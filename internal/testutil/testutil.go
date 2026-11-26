@@ -147,3 +147,23 @@ func ReadyTrack(t *testing.T, pool *pgxpool.Pool, userID, artistID, releaseID, t
 	}
 	return trackID, uploadID
 }
+
+// SerializeOutbox makes the calling test the only one touching the global push outbox
+// (the sender works every queued message, so tests of different packages must not overlap).
+// The lock is released when the test ends.
+func SerializeOutbox(t *testing.T, pool *pgxpool.Pool) {
+	t.Helper()
+	ctx := context.Background()
+	conn, err := pool.Acquire(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := conn.Exec(ctx, `SELECT pg_advisory_lock(7770001)`); err != nil {
+		conn.Release()
+		t.Fatal(err)
+	}
+	t.Cleanup(func() {
+		conn.Exec(context.Background(), `SELECT pg_advisory_unlock(7770001)`) //nolint:errcheck
+		conn.Release()
+	})
+}

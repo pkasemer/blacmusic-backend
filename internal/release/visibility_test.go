@@ -36,10 +36,10 @@ func TestVisibilityIsEnforcedEverywhere(t *testing.T) {
 	ctx := context.Background()
 
 	reg := source.NewRegistry()
-	reg.Register(native.New(e.pool, fakeSigner{}, time.Hour))
-	catalogH := catalog.NewHandler(e.pool, reg)
+	reg.Register(native.New(e.pool, fakeSigner{}, time.Hour, "http://api.test"))
+	catalogH := catalog.NewHandler(e.pool, reg, "http://api.test")
 	playbackH := playback.NewHandler(e.pool, reg)
-	libraryH := library.NewHandler(e.pool)
+	libraryH := library.NewHandler(e.pool, playlist.NewStore(e.pool, "http://test"))
 	r := chi.NewRouter()
 	r.Use(auth.Require(auth.NewTokenService(testutil.Secret, time.Minute)))
 	r.Get("/search", catalogH.Search)
@@ -71,7 +71,7 @@ func TestVisibilityIsEnforcedEverywhere(t *testing.T) {
 		tr, _ := b["tracks"].([]any)
 		return len(tr)
 	}
-	ps := playlist.NewStore(e.pool)
+	ps := playlist.NewStore(e.pool, "http://test")
 	strangerList, _ := ps.Create(ctx, strangerID, "Mine", "", false)
 
 	// ---- draft: only the owning artist can reach it.

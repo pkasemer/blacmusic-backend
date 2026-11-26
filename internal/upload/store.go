@@ -10,6 +10,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"log/slog"
 	"time"
 
 	"github.com/jackc/pgx/v5"
@@ -43,8 +44,11 @@ var (
 	ErrLimit           = errors.New("upload: too many unfinished uploads")
 	ErrDailyLimit      = errors.New("upload: daily upload limit reached")
 	ErrNoArtist        = errors.New("upload: this account has no artist profile")
+	ErrArtistBanned    = errors.New("upload: this artist profile is suspended")
 	ErrReleaseNotFound = errors.New("upload: release not found")
 	ErrInUse           = errors.New("upload: cannot be removed in its current state")
+	ErrTrackNotFound   = errors.New("upload: track not found")
+	ErrTrackNotDraft   = errors.New("upload: only a track in a draft release can have its file replaced")
 )
 
 // QuotaError is returned when a file does not fit in the artist's storage.
@@ -80,7 +84,26 @@ type Upload struct {
 }
 
 // Store is the database side of uploads and the processing queue.
-type Store struct{ pool *pgxpool.Pool }
+type Store struct {
+	pool *pgxpool.Pool
+	// OnReady, when set, is told (inside the transaction that finishes the last unfinished upload of a
+	// release) that the release's audio is all processed. The worker sets it.
+	OnReady ReadyHook
+}
+
+// ReadyEvent says that every file uploaded to a release has been processed.
+type ReadyEvent struct {
+	UploadID     string // the upload that finished last
+	ReleaseID    string
+	ReleaseTitle string
+	OwnerUserID  string
+	Tracks       int  // tracks in the release now
+	Live         bool // the release is already public
+}
+
+// ReadyHook receives a ReadyEvent inside the finishing transaction. A failing hook is logged and
+// rolled back on its own; it never stops a track from being finished.
+type ReadyHook func(ctx context.Context, tx pgx.Tx, e ReadyEvent) error
 
 // NewStore creates the store.
 func NewStore(pool *pgxpool.Pool) *Store { return &Store{pool: pool} }
@@ -113,7 +136,10 @@ type NewUpload struct {
 	Filename     string
 	SizeBytes    int64
 	TermsVersion string // the terms the artist confirmed they own the rights under
-	PartSize     int64  // > 0 makes this a resumable multipart upload with parts of this size
+	// AsAdmin: an administrator uploads on behalf of the release artist (ReleaseID is required). No per-artist
+	// upload limits apply, and no storage quota when the artist has no owner account.
+	AsAdmin  bool
+	PartSize int64 // > 0 makes this a resumable multipart upload with parts of this size
 }
 
 // Create reserves an upload for the user's artist profile. In one transaction,
@@ -128,36 +154,54 @@ func (s *Store) Create(ctx context.Context, n NewUpload) (*Upload, error) {
 	defer tx.Rollback(ctx) //nolint:errcheck
 
 	var artistID, artistName string
-	var verified bool
-	err = tx.QueryRow(ctx, `SELECT id, name, verification = 'verified' FROM artists WHERE owner_user_id = $1 FOR UPDATE`, n.UserID).
-		Scan(&artistID, &artistName, &verified)
-	if errors.Is(err, pgx.ErrNoRows) {
-		return nil, ErrNoArtist
+	var verified, banned, owned bool
+	if n.AsAdmin {
+		err = tx.QueryRow(ctx, `
+			SELECT a.id, a.name, a.verification = 'verified', a.banned_at IS NOT NULL, a.owner_user_id IS NOT NULL
+			FROM albums al JOIN artists a ON a.id = al.artist_id WHERE al.id = $1 FOR UPDATE OF a`, n.ReleaseID).
+			Scan(&artistID, &artistName, &verified, &banned, &owned)
+		if errors.Is(err, pgx.ErrNoRows) {
+			return nil, ErrReleaseNotFound
+		}
+	} else {
+		owned = true
+		err = tx.QueryRow(ctx, `SELECT id, name, verification = 'verified', banned_at IS NOT NULL FROM artists WHERE owner_user_id = $1 FOR UPDATE`, n.UserID).
+			Scan(&artistID, &artistName, &verified, &banned)
+		if errors.Is(err, pgx.ErrNoRows) {
+			return nil, ErrNoArtist
+		}
 	}
 	if err != nil {
 		return nil, err
 	}
-
-	var active, today int
-	if err := tx.QueryRow(ctx, `SELECT
-		count(*) FILTER (WHERE status IN ('pending','queued','processing')),
-		count(*) FILTER (WHERE created_at > now() - interval '24 hours')
-		FROM uploads WHERE artist_id = $1`, artistID).Scan(&active, &today); err != nil {
-		return nil, err
-	}
-	if active >= MaxActivePerArtist {
-		return nil, ErrLimit
-	}
-	if !verified && today >= MaxDailyUnverified {
-		return nil, ErrDailyLimit
+	if banned {
+		return nil, ErrArtistBanned
 	}
 
-	q, err := artist.QuotaFor(ctx, tx, artistID)
-	if err != nil {
-		return nil, err
+	if !n.AsAdmin {
+		var active, today int
+		if err := tx.QueryRow(ctx, `SELECT
+			count(*) FILTER (WHERE status IN ('pending','queued','processing')),
+			count(*) FILTER (WHERE created_at > now() - interval '24 hours')
+			FROM uploads WHERE artist_id = $1`, artistID).Scan(&active, &today); err != nil {
+			return nil, err
+		}
+		if active >= MaxActivePerArtist {
+			return nil, ErrLimit
+		}
+		if !verified && today >= MaxDailyUnverified {
+			return nil, ErrDailyLimit
+		}
 	}
-	if n.SizeBytes > q.RemainingStorageBytes {
-		return nil, &QuotaError{Required: n.SizeBytes, Remaining: q.RemainingStorageBytes, Limit: q.TotalStorageBytes, Used: q.UsedStorageBytes}
+
+	if owned { // an artist without an account has no storage allowance to charge
+		q, err := artist.QuotaFor(ctx, tx, artistID)
+		if err != nil {
+			return nil, err
+		}
+		if n.SizeBytes > q.RemainingStorageBytes {
+			return nil, &QuotaError{Required: n.SizeBytes, Remaining: q.RemainingStorageBytes, Limit: q.TotalStorageBytes, Used: q.UsedStorageBytes}
+		}
 	}
 
 	var releaseID, releaseTitle string
@@ -234,6 +278,16 @@ func (s *Store) Queue(ctx context.Context, id string, actualSize int64) (*Upload
 	return u, err
 }
 
+// QueueStored queues a pending upload whose file is already in storage under key (a bulk import sends all its
+// files before any upload exists). It runs inside the caller's transaction.
+func (s *Store) QueueStored(ctx context.Context, tx pgx.Tx, id, key string) error {
+	tag, err := tx.Exec(ctx, `UPDATE uploads SET original_key = $2, status = 'queued', updated_at = now() WHERE id = $1 AND status = 'pending'`, id, key)
+	if err == nil && tag.RowsAffected() == 0 {
+		return ErrNotFound
+	}
+	return err
+}
+
 // Fail marks an upload failed with a message that is safe to show the user.
 // A failed upload no longer counts against the artist's storage.
 func (s *Store) Fail(ctx context.Context, id, msg string) error {
@@ -261,6 +315,52 @@ func (s *Store) Delete(ctx context.Context, id, userID string) (*Stale, error) {
 	if errors.Is(err, pgx.ErrNoRows) {
 		var exists bool
 		if qerr := s.pool.QueryRow(ctx, `SELECT EXISTS (SELECT 1 FROM uploads WHERE id = $1 AND user_id = $2)`, id, userID).Scan(&exists); qerr != nil {
+			return nil, qerr
+		}
+		if exists {
+			return nil, ErrInUse
+		}
+		return nil, ErrNotFound
+	}
+	if err != nil {
+		return nil, err
+	}
+	return &st, nil
+}
+
+// Discard removes an upload that no worker has started on (pending, queued or failed), for example
+// when an artist swaps the file of a song in a draft. It returns what to delete from storage. A
+// finished upload is removed by deleting its track; one being processed returns ErrInUse.
+func (s *Store) Discard(ctx context.Context, id, userID string) (*Stale, error) {
+	var st Stale
+	err := s.pool.QueryRow(ctx, `
+		DELETE FROM uploads WHERE id = $1 AND user_id = $2 AND status IN ('pending','queued','failed')
+		RETURNING original_key, multipart_id`, id, userID).Scan(&st.Key, &st.MultipartID)
+	if errors.Is(err, pgx.ErrNoRows) {
+		var exists bool
+		if qerr := s.pool.QueryRow(ctx, `SELECT EXISTS (SELECT 1 FROM uploads WHERE id = $1 AND user_id = $2)`, id, userID).Scan(&exists); qerr != nil {
+			return nil, qerr
+		}
+		if exists {
+			return nil, ErrInUse
+		}
+		return nil, ErrNotFound
+	}
+	if err != nil {
+		return nil, err
+	}
+	return &st, nil
+}
+
+// DeleteAny is Delete for an administrator: any user's upload that has not become a track.
+func (s *Store) DeleteAny(ctx context.Context, id string) (*Stale, error) {
+	var st Stale
+	err := s.pool.QueryRow(ctx, `
+		DELETE FROM uploads WHERE id = $1 AND status IN ('pending','failed')
+		RETURNING original_key, multipart_id`, id).Scan(&st.Key, &st.MultipartID)
+	if errors.Is(err, pgx.ErrNoRows) {
+		var exists bool
+		if qerr := s.pool.QueryRow(ctx, `SELECT EXISTS (SELECT 1 FROM uploads WHERE id = $1)`, id).Scan(&exists); qerr != nil {
 			return nil, qerr
 		}
 		if exists {
@@ -315,7 +415,12 @@ func (s *Store) Claim(ctx context.Context, staleAfter time.Duration, maxAttempts
 		UPDATE uploads SET status = 'processing', attempts = attempts + 1, locked_at = now(), updated_at = now()
 		WHERE id = (
 			SELECT id FROM uploads
-			WHERE status = 'queued'
+			WHERE (status = 'queued'
+			       -- an upload for a release that a transfer is filling waits until its transfer is being worked on
+			       -- (matched by release, so it holds even before the artist has attached the upload)
+			       AND NOT EXISTS (SELECT 1 FROM transfer_items ti JOIN transfers tr ON tr.id = ti.transfer_id
+			                       WHERE ti.release_id = uploads.release_id AND ti.status NOT IN ('dropped', 'skipped_duplicate')
+			                         AND tr.status IN ('collecting', 'queued', 'retrying')))
 			   OR (status = 'processing' AND attempts < $2 AND locked_at < now() - make_interval(secs => $1))
 			ORDER BY created_at
 			FOR UPDATE SKIP LOCKED
@@ -433,5 +538,74 @@ func (s *Store) Finish(ctx context.Context, u *Upload, res Result) error {
 	if tag.RowsAffected() != 1 {
 		return fmt.Errorf("upload %s is no longer being processed", u.ID)
 	}
+	if s.OnReady != nil {
+		s.notifyReady(ctx, tx, u, releaseVisibility == "public")
+	}
 	return tx.Commit(ctx)
+}
+
+// notifyReady calls OnReady when this was the last unfinished upload of a release that belongs to no
+// transfer (transfers report on their own).
+func (s *Store) notifyReady(ctx context.Context, tx pgx.Tx, u *Upload, live bool) {
+	ev := ReadyEvent{UploadID: u.ID, ReleaseID: u.ReleaseID, Live: live}
+	err := tx.QueryRow(ctx, `
+		SELECT al.title, a.owner_user_id::text, (SELECT count(*) FROM tracks WHERE album_id = al.id)
+		FROM albums al JOIN artists a ON a.id = al.artist_id
+		WHERE al.id = $1 AND a.owner_user_id IS NOT NULL
+		  AND NOT EXISTS (SELECT 1 FROM uploads o WHERE o.release_id = al.id AND o.id <> $2 AND o.status IN ('pending', 'queued', 'processing'))
+		  AND NOT EXISTS (SELECT 1 FROM transfer_items ti WHERE ti.release_id = al.id)`, u.ReleaseID, u.ID).
+		Scan(&ev.ReleaseTitle, &ev.OwnerUserID, &ev.Tracks)
+	if err != nil {
+		if !errors.Is(err, pgx.ErrNoRows) {
+			slog.Error("release ready lookup", "release", u.ReleaseID, "err", err)
+		}
+		return
+	}
+	sp, err := tx.Begin(ctx)
+	if err != nil {
+		slog.Error("release ready hook", "release", u.ReleaseID, "err", err)
+		return
+	}
+	if herr := s.OnReady(ctx, sp, ev); herr != nil {
+		slog.Error("release ready hook", "release", u.ReleaseID, "err", herr)
+		_ = sp.Rollback(ctx)
+		return
+	}
+	if err := sp.Commit(ctx); err != nil {
+		slog.Error("release ready hook", "release", u.ReleaseID, "err", err)
+	}
+}
+
+// TrackMeta is what a replacement upload inherits from the track it replaces.
+type TrackMeta struct {
+	ReleaseID   string
+	Title       string
+	Genre       string
+	TrackNumber *int
+	Explicit    bool
+}
+
+// DraftTrack loads a track of the user's that is still in a draft release.
+func (s *Store) DraftTrack(ctx context.Context, trackID, userID string) (*TrackMeta, error) {
+	var m TrackMeta
+	var visibility string
+	var genre *string
+	err := s.pool.QueryRow(ctx, `
+		SELECT t.album_id, t.title, t.genre, t.track_number, t.explicit, t.visibility
+		FROM tracks t JOIN artists a ON a.id = t.artist_id
+		WHERE t.id = $1 AND a.owner_user_id = $2 AND t.album_id IS NOT NULL`, trackID, userID).
+		Scan(&m.ReleaseID, &m.Title, &genre, &m.TrackNumber, &m.Explicit, &visibility)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return nil, ErrTrackNotFound
+	}
+	if err != nil {
+		return nil, err
+	}
+	if visibility != "draft" {
+		return nil, ErrTrackNotDraft
+	}
+	if genre != nil {
+		m.Genre = *genre
+	}
+	return &m, nil
 }

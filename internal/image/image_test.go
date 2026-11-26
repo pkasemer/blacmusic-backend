@@ -190,3 +190,18 @@ func TestURL(t *testing.T) {
 		t.Fatalf("URL = %s", got)
 	}
 }
+
+func TestLargeURL(t *testing.T) {
+	if got := LargeURL("http://api.test/v1/media/img_0123456789abcdef0123456789abcdef/medium.jpg"); got != "http://api.test/v1/media/img_0123456789abcdef0123456789abcdef/large.jpg" {
+		t.Fatalf("our own picture = %q", got)
+	}
+	for _, other := range []string{"", "https://example.com/cover.jpg", "http://api.test/v1/media/img_x/small.jpg"} {
+		if got := LargeURL(other); got != "" {
+			t.Errorf("LargeURL(%q) = %q, want none", other, got)
+		}
+	}
+	id := "img_abc"
+	if PersonLargeURL("http://api.test", &id) != "http://api.test/v1/media/img_abc/large.jpg" || PersonLargeURL("http://api.test", nil) != "" {
+		t.Fatal("PersonLargeURL")
+	}
+}

@@ -6,9 +6,9 @@ import (
 	"log/slog"
 	"net/http"
 	"strconv"
-	"strings"
 
 	"github.com/blacmusic/backend/internal/httpx"
+	"github.com/blacmusic/backend/internal/identity"
 )
 
 // Handler exposes the auth service over HTTP.
@@ -119,8 +119,16 @@ func (h *Handler) fail(w http.ResponseWriter, err error) {
 		httpx.Error(w, http.StatusConflict, "email_taken", err.Error())
 	case errors.Is(err, ErrInvalidCredentials):
 		httpx.Error(w, http.StatusUnauthorized, "invalid_credentials", err.Error())
-	case errors.Is(err, ErrInvalidToken):
-		httpx.Error(w, http.StatusUnauthorized, "invalid_token", err.Error())
+	case errors.Is(err, ErrAccountBanned):
+		httpx.Error(w, http.StatusForbidden, "account_banned", err.Error())
+	case errors.Is(err, ErrInvalidToken), errors.Is(err, identity.ErrInvalidToken):
+		httpx.Error(w, http.StatusUnauthorized, "invalid_token", "invalid or expired token")
+	case errors.Is(err, identity.ErrUnavailable):
+		httpx.Error(w, http.StatusServiceUnavailable, "provider_unavailable", "this sign-in method is not available right now")
+	case errors.Is(err, ErrEmailConflict):
+		httpx.Error(w, http.StatusConflict, "email_conflict", err.Error())
+	case errors.Is(err, ErrNoEmail):
+		httpx.Error(w, http.StatusUnprocessableEntity, "no_email", err.Error())
 	default:
 		slog.Error("auth handler", "err", err)
 		httpx.Error(w, http.StatusInternalServerError, "internal", "something went wrong")
@@ -137,20 +145,5 @@ func UserID(ctx context.Context) (string, bool) {
 
 // Require rejects requests without a valid Bearer access token.
 func Require(tokens *TokenService) func(http.Handler) http.Handler {
-	return func(next http.Handler) http.Handler {
-		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-			h := r.Header.Get("Authorization")
-			raw, ok := strings.CutPrefix(h, "Bearer ")
-			if !ok || raw == "" {
-				httpx.Error(w, http.StatusUnauthorized, "unauthorized", "missing bearer token")
-				return
-			}
-			id, err := tokens.ParseAccess(raw)
-			if err != nil {
-				httpx.Error(w, http.StatusUnauthorized, "unauthorized", "invalid or expired access token")
-				return
-			}
-			next.ServeHTTP(w, r.WithContext(context.WithValue(r.Context(), ctxKey{}, id)))
-		})
-	}
+	return RequireWith(tokens, nil)
 }

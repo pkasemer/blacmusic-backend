@@ -6,18 +6,19 @@ site's nginx config and never restarts a running service.
 
 ```
 Cloudflare ──> nginx :443 ──> api      127.0.0.1:8080  (blacmusic.pkasemer.com)
-               nginx :443 ──> storage  127.0.0.1:9000  (media.blacmusic.pkasemer.com, presigned uploads/downloads)
+               nginx :443 ──> storage  127.0.0.1:9000  (blacmedia.pkasemer.com, presigned uploads/downloads)
                                  docker compose: postgres, redis, storage (RustFS), api, worker (ffmpeg)
 ```
 
 ## One-time setup
 
-1. **DNS** (Cloudflare): `blacmusic` and `media.blacmusic` as A records to the server.
-   - `blacmusic` can be proxied (orange cloud).
-   - `media.blacmusic` must be **DNS only** (grey cloud). Cloudflare's free certificate covers only one
-     level (`*.pkasemer.com`), not `media.blacmusic.pkasemer.com`, and large audio is better served
-     directly. Alternatively use a one-level name such as `blacmusic-media.pkasemer.com`
-     (then change `S3_PUBLIC_ENDPOINT` and the nginx `server_name`).
+1. **DNS** (Cloudflare): `blacmusic` and `blacmedia` as A records to the server.
+   - Use **one-level** names (`x.pkasemer.com`): Cloudflare's free certificate covers `*.pkasemer.com` but
+     not two-level names such as `media.blacmusic.pkasemer.com`, which fail TLS when proxied.
+   - `blacmusic` can be proxied (orange cloud). `blacmedia` carries the audio: "DNS only" (grey cloud)
+     sends phones straight to the server (best for large audio; Cloudflare's free plan limits heavy
+     media traffic through its proxy); proxied also works, with a 100 MB request limit that the 8 MiB
+     upload parts stay far below.
    - SSL/TLS mode: **Full** or **Full (strict)**, never Flexible.
 2. **Prepare the server** (as root; adds user `pk`, Docker, `/opt/blacmusic`):
    ```bash
@@ -30,7 +31,7 @@ Cloudflare ──> nginx :443 ──> api      127.0.0.1:8080  (blacmusic.pkasem
    scp deploy/nginx/blacmusic.conf root@HOST:/tmp/blacmusic.conf
    ssh root@HOST 'bash -s' < deploy/nginx-setup.sh
    ssh root@HOST 'certbot certonly --webroot -w /var/www/certbot -d blacmusic.pkasemer.com \
-       -d media.blacmusic.pkasemer.com --cert-name blacmusic --deploy-hook "systemctl reload nginx"'
+       -d blacmedia.pkasemer.com --cert-name blacmusic --deploy-hook "systemctl reload nginx"'
    ssh root@HOST 'ln -sfn /etc/letsencrypt/live/blacmusic/fullchain.pem /etc/nginx/blacmusic/fullchain.pem; \
        ln -sfn /etc/letsencrypt/live/blacmusic/privkey.pem /etc/nginx/blacmusic/privkey.pem; \
        nginx -t && systemctl reload nginx'
@@ -64,3 +65,8 @@ docker stats --no-stream
 ```
 Not set up yet (worth doing before real users): backups of the `pgdata` and `storagedata` volumes, an
 uptime check on `https://blacmusic.pkasemer.com/readyz`, and disk monitoring.
+
+## Keeping the server healthy
+- **How it is doing:** the admin site reads `GET /v1/admin/system` (load, memory, disk, what the app stores, waiting work, alerts) and `GET /v1/admin/system/history`. The worker takes a reading every 5 minutes and keeps 30 days.
+- **Old versions:** `ship.sh` keeps the newest three backend images.
+- **Cleaning up:** `vps-cleanup.sh` (run `report` first; nothing changes without `--apply`). It tidies logs and caches, and retires the old Mwonya sites in separate steps: `mwonya-offline` (can be undone), then `backup-mwonya.sh` from your PC, then `mwonya-delete`. The usage is at the top of each script.

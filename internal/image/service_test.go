@@ -252,3 +252,59 @@ func TestCheckOwned(t *testing.T) {
 		}
 	}
 }
+
+func TestExpireUnusedKeepsWhatIsInUse(t *testing.T) {
+	e := setup(t)
+	ctx := context.Background()
+	uid := testutil.User(t, e.pool, "user", true)
+	artistID := testutil.Artist(t, e.pool, uid, testutil.Unique("Janitor"), testutil.GiB)
+	rel := testutil.Release(t, e.pool, artistID, "R", "album", "draft")
+
+	make := func(purpose, age string) string {
+		var id string
+		if err := e.pool.QueryRow(ctx, `INSERT INTO images (owner_id, purpose, status, original_key, size_bytes, created_at)
+			VALUES ($1,$2,'ready','k',1, now() - $3::interval) RETURNING id`, uid, purpose, age).Scan(&id); err != nil {
+			t.Fatal(err)
+		}
+		for _, s := range Sizes {
+			e.blobs.Put(variantKey(id, s), []byte("jpeg"))
+		}
+		return id
+	}
+	oldUnused := make("avatar", "3 days")  // a replaced avatar
+	oldCover := make("cover", "3 days")    // a replaced cover
+	fresh := make("avatar", "1 hour")      // just uploaded, not attached yet
+	usedAvatar := make("avatar", "3 days") // current avatar
+	usedCover := make("cover", "3 days")   // current cover
+	if _, err := e.pool.Exec(ctx, `UPDATE users SET avatar_image_id = $2 WHERE id = $1`, uid, usedAvatar); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := e.pool.Exec(ctx, `UPDATE albums SET cover_image_id = $2 WHERE id = $1`, rel, usedCover); err != nil {
+		t.Fatal(err)
+	}
+
+	if _, err := ExpireUnused(ctx, e.pool, e.blobs, 24*time.Hour); err != nil {
+		t.Fatal(err)
+	}
+	exists := func(id string) bool {
+		var n int
+		e.pool.QueryRow(ctx, `SELECT count(*) FROM images WHERE id=$1`, id).Scan(&n) //nolint:errcheck
+		_, stored := e.blobs.Get(variantKey(id, SizeMedium))
+		return n == 1 && stored
+	}
+	gone := func(id string) bool {
+		var n int
+		e.pool.QueryRow(ctx, `SELECT count(*) FROM images WHERE id=$1`, id).Scan(&n) //nolint:errcheck
+		_, stored := e.blobs.Get(variantKey(id, SizeMedium))
+		return n == 0 && !stored
+	}
+	if !gone(oldUnused) || !gone(oldCover) {
+		t.Fatal("replaced pictures must be deleted, row and files")
+	}
+	if !exists(fresh) {
+		t.Fatal("a freshly uploaded picture must be kept: it has not been attached yet")
+	}
+	if !exists(usedAvatar) || !exists(usedCover) {
+		t.Fatal("pictures in use must be kept")
+	}
+}

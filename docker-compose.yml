@@ -50,19 +50,31 @@ services:
       DATABASE_URL: postgres://blac:blac@postgres:5432/blac?sslmode=disable
       REDIS_URL: redis://redis:6379/0
       S3_ENDPOINT: storage:9000
-      S3_PUBLIC_ENDPOINT: localhost:9000   # host clients use in presigned URLs
+      S3_PUBLIC_ENDPOINT: ${S3_PUBLIC_ENDPOINT:-localhost:9000}   # host:port clients use in presigned URLs
+      # Dev only: sign storage links for whatever host the client used to reach the API
+      # (localhost, 10.0.2.2 for the Android emulator, or the PC's LAN address for a phone).
+      S3_PUBLIC_HOST_FROM_REQUEST: "true"
       S3_ACCESS_KEY: blacminio
       S3_SECRET_KEY: blacminio-secret
       S3_BUCKET: blac-media
       FEED_ALLOW_PRIVATE: "true"           # dev only: lets feeds be served from this machine/network
       PUBLIC_API_URL: http://localhost:8080   # base URL clients use; Android emulator: http://10.0.2.2:8080
+      YOUTUBE_FAKE: "true"                 # dev only: a built-in fake YouTube channel, no Google project needed
+      GOOGLE_AUTH_FAKE: "true"             # dev only: a built-in fake Google sign-in
+      APPLE_AUTH_FAKE: "true"              # dev only: Apple identity tokens of the form fake:<id>:<email> are accepted
+      PUSH_FAKE: "true"                    # dev only: nothing is pushed; see GET /v1/dev/push-outbox
+      EDITORIAL_OWNER_EMAIL: ${EDITORIAL_OWNER_EMAIL:-}   # admin site: the administrator account that owns the editorial playlists
+      ADMIN_SITE_URL: ${ADMIN_SITE_URL:-}                    # bulk import answers link to this admin site; empty leaves links out
+      IMPORT_MAX_TOTAL_MB: ${IMPORT_MAX_TOTAL_MB:-1024}      # all files of one bulk import together
+      IMPORT_MIN_FREE_GB: ${IMPORT_MIN_FREE_GB:-2}           # bulk imports are refused below this much free disk
+      YOUTUBE_AUDIO_FETCH: "false"         # parked (see the worker): transfers do not offer the YouTube audio import
       # No SMTP_HOST in development: verification codes are written to the API log
       # (docker compose logs api). Set SMTP_HOST/SMTP_PORT/SMTP_USER/SMTP_PASSWORD/SMTP_FROM to send real email.
     ports: ["8080:8080"]
 
   # Turns uploaded originals into the low / medium / high AAC renditions.
   worker:
-    build: { context: ., target: worker }
+    build: { context: ., target: worker, args: { WITH_YTDLP: "1" } }   # dev image keeps yt-dlp so the parked YouTube import can be switched on
     depends_on:
       postgres: { condition: service_healthy }
       storage: { condition: service_healthy }
@@ -76,6 +88,8 @@ services:
       WORKER_CONCURRENCY: "2"
       PUBLIC_API_URL: http://localhost:8080
       FEED_ALLOW_PRIVATE: "true"           # dev only
+      PUSH_FAKE: "true"                    # dev only: push messages are kept in the outbox instead of sent
+      YOUTUBE_AUDIO_FETCH: "false"         # parked: set to true to import audio from an artist's own YouTube videos (YouTube blocks datacenter addresses)
 
 volumes:
   pgdata:

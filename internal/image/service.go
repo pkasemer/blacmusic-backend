@@ -319,3 +319,111 @@ func serverError(w http.ResponseWriter, err error) {
 	slog.Error("image handler", "err", err)
 	httpx.Error(w, http.StatusInternalServerError, "internal", "something went wrong")
 }
+
+// ExpireUnused deletes finished or rejected images that nothing refers to any
+// more (a replaced avatar, a replaced cover) once they are older than
+// olderThan, so replacing a picture does not use up the per-account image
+// allowance or leave files behind. The age gives a freshly uploaded image time
+// to be attached.
+func ExpireUnused(ctx context.Context, pool *pgxpool.Pool, blobs interface {
+	Remove(ctx context.Context, key string) error
+}, olderThan time.Duration) (int, error) {
+	rows, err := pool.Query(ctx, `
+		DELETE FROM images i
+		WHERE i.status IN ('ready', 'failed')
+		  AND i.created_at < now() - make_interval(secs => $1)
+		  AND NOT EXISTS (SELECT 1 FROM users u  WHERE u.avatar_image_id = i.id)
+		  AND NOT EXISTS (SELECT 1 FROM artists a WHERE a.avatar_image_id = i.id)
+		  AND NOT EXISTS (SELECT 1 FROM albums al WHERE al.cover_image_id = i.id)
+		  AND NOT EXISTS (SELECT 1 FROM playlists pl WHERE pl.cover_image_id = i.id)
+		RETURNING i.id`, olderThan.Seconds())
+	if err != nil {
+		return 0, err
+	}
+	defer rows.Close()
+	var ids []string
+	for rows.Next() {
+		var id string
+		if err := rows.Scan(&id); err != nil {
+			return 0, err
+		}
+		ids = append(ids, id)
+	}
+	if err := rows.Err(); err != nil {
+		return 0, err
+	}
+	for _, id := range ids {
+		for _, size := range Sizes {
+			_ = blobs.Remove(ctx, variantKey(id, size))
+		}
+		_ = blobs.Remove(ctx, originalKey(id))
+	}
+	return len(ids), nil
+}
+
+// Ingest turns raw image bytes into a finished image owned by ownerID, exactly
+// as the upload flow does (validation, orientation, EXIF removal, three sizes),
+// for server-side sources such as a channel thumbnail. It returns the image id.
+func Ingest(ctx context.Context, pool *pgxpool.Pool, blobs Blobs, ownerID, purpose string, raw []byte) (string, error) {
+	res, err := Process(raw)
+	if err != nil {
+		return "", err
+	}
+	var id string
+	err = pool.QueryRow(ctx, `
+		WITH n AS (SELECT 'img_' || replace(gen_random_uuid()::text, '-', '') AS id)
+		INSERT INTO images (id, owner_id, purpose, original_key, size_bytes, status, width, height)
+		SELECT n.id, $1, $2, 'images/originals/' || n.id, $3, 'ready', $4, $5 FROM n
+		RETURNING id`, ownerID, purpose, len(raw), res.Width, res.Height).Scan(&id)
+	if err != nil {
+		return "", err
+	}
+	dir, err := os.MkdirTemp("", "blac-img-*")
+	if err != nil {
+		return "", err
+	}
+	defer os.RemoveAll(dir)
+	for _, size := range Sizes {
+		path := filepath.Join(dir, size)
+		if err := os.WriteFile(path, res.Variants[size], 0o600); err != nil {
+			return "", err
+		}
+		if err := blobs.UploadFile(ctx, variantKey(id, size), path, "image/jpeg"); err != nil {
+			_, _ = pool.Exec(ctx, `DELETE FROM images WHERE id = $1`, id)
+			return "", err
+		}
+	}
+	return id, nil
+}
+
+// Purge deletes every image a user owns: the stored files first, then the rows.
+// It is part of deleting an account and safe to run again.
+func Purge(ctx context.Context, pool *pgxpool.Pool, blobs interface {
+	Remove(ctx context.Context, key string) error
+}, ownerID string) error {
+	rows, err := pool.Query(ctx, `SELECT id FROM images WHERE owner_id = $1`, ownerID)
+	if err != nil {
+		return err
+	}
+	var ids []string
+	for rows.Next() {
+		var id string
+		if err := rows.Scan(&id); err != nil {
+			rows.Close()
+			return err
+		}
+		ids = append(ids, id)
+	}
+	rows.Close()
+	if err := rows.Err(); err != nil {
+		return err
+	}
+	for _, id := range ids {
+		for _, size := range Sizes {
+			_ = blobs.Remove(ctx, variantKey(id, size))
+		}
+		_ = blobs.Remove(ctx, originalKey(id))
+	}
+	_, err = pool.Exec(ctx, `DELETE FROM images WHERE owner_id = $1`, ownerID)
+	return err
+}

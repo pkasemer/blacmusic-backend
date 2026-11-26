@@ -25,6 +25,26 @@ func (h *Handler) Routes(r chi.Router) {
 	r.Patch("/artists/{id}", h.update)
 	r.Post("/artists/{id}/verification-request", h.requestVerification)
 	r.Get("/artists/{id}/quota", h.quota)
+	r.Post("/artists/{id}/follow", h.follow)
+	r.Delete("/artists/{id}/follow", h.unfollow)
+}
+
+func (h *Handler) follow(w http.ResponseWriter, r *http.Request) {
+	uid, _ := auth.UserID(r.Context())
+	if err := h.store.Follow(r.Context(), uid, chi.URLParam(r, "id")); err != nil {
+		Fail(w, err)
+		return
+	}
+	w.WriteHeader(http.StatusNoContent)
+}
+
+func (h *Handler) unfollow(w http.ResponseWriter, r *http.Request) {
+	uid, _ := auth.UserID(r.Context())
+	if err := h.store.Unfollow(r.Context(), uid, chi.URLParam(r, "id")); err != nil {
+		Fail(w, err)
+		return
+	}
+	w.WriteHeader(http.StatusNoContent)
 }
 
 func (h *Handler) create(w http.ResponseWriter, r *http.Request) {
