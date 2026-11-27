@@ -23,6 +23,7 @@ import (
 	"github.com/blacmusic/backend/internal/importopt"
 	"github.com/blacmusic/backend/internal/playlist"
 	"github.com/blacmusic/backend/internal/release"
+	"github.com/blacmusic/backend/internal/review"
 	"github.com/blacmusic/backend/internal/showcase"
 	"github.com/blacmusic/backend/internal/sysmetrics"
 	"github.com/blacmusic/backend/internal/upload"
@@ -41,6 +42,12 @@ type Handler struct {
 	Auth      *auth.Service
 	Redis     *redis.Client
 	PublicURL string
+	// Playback answers like GET /v1/playback/{id}, for any track (set by the server).
+	Playback http.HandlerFunc
+	// Media gives links to listen to songs waiting for review (set by the server).
+	Media interface {
+		PresignGet(ctx context.Context, key string, ttl time.Duration) (string, error)
+	}
 	// EditorialEmail is the account that owns the editorial playlists (EDITORIAL_OWNER_EMAIL).
 	EditorialEmail string
 	Bans           interface{ Invalidate(userID string) }
@@ -54,11 +61,27 @@ type Handler struct {
 		AdminCreate(ctx context.Context, artistID, adminID string, in release.Input, audit func(ctx context.Context, tx pgx.Tx, id string) error) (string, error)
 		AdminPublish(ctx context.Context, id string, publishAt *time.Time, audit func(ctx context.Context, tx pgx.Tx) error) error
 		AdminUnpublish(ctx context.Context, id string, audit func(ctx context.Context, tx pgx.Tx) error) error
+		AdminCombine(ctx context.Context, adminID string, in release.CombineInput,
+			audit func(ctx context.Context, tx pgx.Tx, id, artistID string, from []release.Combined) error) (string, error)
+		Decide(ctx context.Context, reviewID string, revision int, adminID string, approve bool, reason string,
+			audit func(ctx context.Context, tx pgx.Tx, r *review.Row, title string) error) error
+		AdminSplit(ctx context.Context, adminID string, in release.SplitInput,
+			audit func(ctx context.Context, tx pgx.Tx, id string, from release.SplitFrom) error) (string, error)
 	}
 	// Uploads lets administrators upload audio into any release (set by the server).
 	Uploads *upload.Handler
 	// APIKeys manages the limited keys of the bulk import (set by the server).
 	APIKeys interface{ KeyRoutes(r chi.Router) }
+	// Blobs is used when an artist is taken away from a user and when a failed song is retried; Transfers for the
+	// former (both set by the server).
+	Blobs interface {
+		Stat(ctx context.Context, key string) (int64, error)
+		Remove(ctx context.Context, key string) error
+		AbortMultipart(ctx context.Context, key, uploadID string) error
+	}
+	Transfers interface {
+		CancelAllOpen(ctx context.Context, userID string) error
+	}
 	// ReadHost measures the server for GET /system; nil means the real machine (tests replace it).
 	ReadHost func() (sysmetrics.Host, bool)
 }
@@ -73,10 +96,19 @@ func (h *Handler) Routes(r chi.Router) {
 	r.Use(h.requireAdmin)
 	h.statsRoutes(r)
 	h.systemRoutes(r)
+	h.processingRoutes(r)
 	h.userRoutes(r)
 	h.artistRoutes(r)
 	h.auditRoutes(r)
 	h.releaseRoutes(r)
+	h.featuredRoutes(r)
+	h.featuredArtistRoutes(r)
+	h.lyricsRoutes(r)
+	if h.Playback != nil {
+		r.Get("/tracks/{id}/playback", h.Playback)
+	}
+	h.reviewRoutes(r)
+	h.metadataRoutes(r)
 	h.catalogRoutes(r)
 	h.editorialRoutes(r)
 	h.searchRoutes(r)

@@ -74,7 +74,7 @@ func (h *Handler) Search(w http.ResponseWriter, r *http.Request) {
 const publicNativeTrack = `t.visibility = 'public'
 	  AND EXISTS (SELECT 1 FROM track_sources ts WHERE ts.track_id = t.id AND ts.source = 'native')`
 
-const savesColumn = `(SELECT count(*) FROM library_tracks l WHERE l.track_id = t.id) AS saves`
+const savesColumn = `(SELECT count(*) FROM signal_saves l WHERE l.track_id = t.id) AS saves`
 
 // trackOrder is the ORDER BY for a track list: "new" is by when the release
 // went live; "popular" is by how many listeners saved the track (real play
@@ -88,6 +88,38 @@ func trackOrder(sort string) (string, bool) {
 		return "saves DESC, " + newest, true
 	}
 	return "", false
+}
+
+// Trending is what people are playing and saving now, never simply what is newest: a song with no activity in the
+// last trendingDays is not on the list, however new it is.
+const (
+	trendingSize = 6
+	trendingDays = 30
+)
+
+// trendScore counts a song's activity in the last days: one point for each listener on each day they played it (so
+// playing it over and over adds nothing) and two for each new save.
+func trendScore(days int) string {
+	d := strconv.Itoa(days)
+	return `((SELECT count(DISTINCT (COALESCE(p.user_id::text, p.id::text), p.at::date)) FROM signal_plays p
+	          WHERE p.track_id = t.id AND p.at > now() - interval '` + d + ` days')
+	       + 2 * (SELECT count(*) FROM signal_saves l WHERE l.track_id = t.id AND l.added_at > now() - interval '` + d + ` days'))`
+}
+
+func trending() (where, order string) {
+	since := `now() - interval '` + strconv.Itoa(trendingDays) + ` days'`
+	where = ` AND t.id IN (SELECT track_id FROM signal_plays WHERE at > ` + since + `
+	                     UNION SELECT track_id FROM signal_saves WHERE added_at > ` + since + `)`
+	// this week first; the month decides between equals and fills a quiet week, then whatever was played last
+	order = recentFirst() + `,
+		(SELECT max(p.at) FROM signal_plays p WHERE p.track_id = t.id) DESC NULLS LAST, t.id`
+	return where, order
+}
+
+// recentFirst ranks by activity: this week first; the month decides between equals and fills a quiet week.
+func recentFirst() string {
+	return trendScore(7) + " DESC, " + trendScore(trendingDays) + ` DESC,
+		(SELECT count(*) FROM signal_plays p WHERE p.track_id = t.id AND p.at > now() - interval '` + strconv.Itoa(trendingDays) + ` days') DESC`
 }
 
 // queryTracks runs a track list query. where may use $1..$len(args).
@@ -119,27 +151,41 @@ func internalError(w http.ResponseWriter, what string, err error) {
 
 // Browse lists public tracks for the Home screen, in the same shape as search.
 //
-//	GET /v1/browse/tracks?sort=new|popular&genre=&limit=&offset=
+//	GET /v1/browse/tracks?sort=new|popular|trending&genre=&limit=&offset=
+//
+// "trending" answers the top 6 unless limit says otherwise.
 func (h *Handler) Browse(w http.ResponseWriter, r *http.Request) {
-	order, ok := trackOrder(r.URL.Query().Get("sort"))
+	sort, size, only := r.URL.Query().Get("sort"), 20, ""
+	if sort == "" {
+		sort = "new"
+	}
+	order, ok := trackOrder(sort)
+	if sort == "popular" {
+		// installed versions of the app fill "Trending now" with this request, so what is active now leads it
+		order = recentFirst() + ", " + order
+	}
+	if sort == "trending" {
+		only, order = trending()
+		size, ok = trendingSize, true
+	}
 	if !ok {
-		httpx.Error(w, http.StatusBadRequest, "bad_request", "sort must be new or popular")
+		httpx.Error(w, http.StatusBadRequest, "bad_request", "sort must be new, popular or trending")
 		return
 	}
-	limit := intParam(r, "limit", 20, 1, 50)
+	limit := intParam(r, "limit", size, 1, 50)
 	offset := intParam(r, "offset", 0, 0, 10000)
 	genreFilter := strings.TrimSpace(r.URL.Query().Get("genre"))
 	if g, ok := genrelist.Lookup(genreFilter); ok { // accept an id ("hip-hop-rap") or any capitalisation
 		genreFilter = g.Name
 	}
 	tracks, err := h.queryTracks(r.Context(),
-		publicNativeTrack+` AND ($1 = '' OR lower(t.genre) = lower($1) OR lower(al.genre) = lower($1))`,
+		publicNativeTrack+` AND ($1 = '' OR lower(t.genre) = lower($1) OR lower(al.genre) = lower($1))`+only,
 		[]any{genreFilter}, order, limit, offset)
 	if err != nil {
 		internalError(w, "browse tracks", err)
 		return
 	}
-	httpx.JSON(w, http.StatusOK, map[string]any{"tracks": tracks})
+	httpx.JSON(w, http.StatusOK, map[string]any{"tracks": tracks, "sort": sort})
 }
 
 // ArtistTracks lists an artist's public tracks (the "Popular" list of the artist page).
@@ -200,7 +246,7 @@ func (h *Handler) BrowseArtists(w http.ResponseWriter, r *http.Request) {
 	var order string
 	switch r.URL.Query().Get("sort") {
 	case "", "featured":
-		order = "(a.verification = 'verified') DESC, followers DESC, a.created_at DESC, a.id"
+		order = "(a.verification = 'verified') DESC, (SELECT count(*) FROM signal_follows l WHERE l.artist_id = a.id) DESC, a.created_at DESC, a.id"
 	case "new":
 		order = `(SELECT max(al.published_at) FROM albums al WHERE ` + publicRelease + `) DESC NULLS LAST, a.created_at DESC, a.id`
 	default:
@@ -212,7 +258,7 @@ func (h *Handler) BrowseArtists(w http.ResponseWriter, r *http.Request) {
 		       (SELECT count(*) FROM library_artists l WHERE l.artist_id = a.id) AS followers,
 		       (SELECT count(*) FROM albums al WHERE `+publicRelease+`) AS releases
 		FROM artists a LEFT JOIN users u ON u.id = a.owner_user_id
-		WHERE EXISTS (SELECT 1 FROM albums al WHERE `+publicRelease+`)
+		WHERE a.banned_at IS NULL AND EXISTS (SELECT 1 FROM albums al WHERE `+publicRelease+`)
 		ORDER BY `+order+`
 		LIMIT $1 OFFSET $2`, intParam(r, "limit", 20, 1, 50), intParam(r, "offset", 0, 0, 10000))
 	if err != nil {
@@ -258,7 +304,7 @@ func (h *Handler) SearchArtists(w http.ResponseWriter, r *http.Request) {
 		       (SELECT count(*) FROM library_artists l WHERE l.artist_id = a.id) AS followers,
 		       (SELECT count(*) FROM albums al WHERE `+publicRelease+`) AS releases
 		FROM artists a LEFT JOIN users u ON u.id = a.owner_user_id
-		WHERE a.name ILIKE $4 AND EXISTS (SELECT 1 FROM albums al WHERE `+publicRelease+`)
+		WHERE a.banned_at IS NULL AND a.name ILIKE $4 AND EXISTS (SELECT 1 FROM albums al WHERE `+publicRelease+`)
 		ORDER BY CASE WHEN lower(a.name) = lower($1) THEN 0 WHEN a.name ILIKE $2 THEN 1 WHEN a.name ILIKE $3 THEN 2 ELSE 3 END,
 		         (a.verification = 'verified') DESC, followers DESC, a.name, a.id
 		LIMIT $5 OFFSET $6`, q, esc+"%", "% "+esc+"%", "%"+esc+"%",
@@ -301,7 +347,7 @@ func (h *Handler) RelatedArtists(w http.ResponseWriter, r *http.Request) {
 		SELECT COALESCE((SELECT array_agg(DISTINCT g) FROM (
 		           SELECT lower(al.genre) AS g FROM albums al WHERE al.artist_id = a.id AND al.visibility = 'public'
 		           UNION SELECT lower(t.genre) FROM tracks t WHERE t.artist_id = a.id AND t.visibility = 'public') x WHERE g <> ''), '{}'),
-		       (SELECT count(*) FROM library_artists l WHERE l.artist_id = a.id)
+		       (SELECT count(*) FROM signal_follows l WHERE l.artist_id = a.id)
 		FROM artists a WHERE a.id = $1`, id).Scan(&genres, &followers)
 	if errors.Is(err, pgx.ErrNoRows) {
 		httpx.Error(w, http.StatusNotFound, "not_found", "artist not found")
@@ -320,8 +366,8 @@ func (h *Handler) RelatedArtists(w http.ResponseWriter, r *http.Request) {
 		            UNION SELECT lower(t.genre) FROM tracks t WHERE t.artist_id = a.id AND t.visibility = 'public') og
 		         WHERE og.g <> '' AND og.g = ANY($2::text[])) AS overlap
 		FROM artists a LEFT JOIN users u ON u.id = a.owner_user_id
-		WHERE a.id <> $1 AND EXISTS (SELECT 1 FROM albums al WHERE `+publicRelease+`)
-		ORDER BY overlap DESC, abs((SELECT count(*) FROM library_artists l WHERE l.artist_id = a.id) - $3::int),
+		WHERE a.id <> $1 AND a.banned_at IS NULL AND EXISTS (SELECT 1 FROM albums al WHERE `+publicRelease+`)
+		ORDER BY overlap DESC, abs((SELECT count(*) FROM signal_follows l WHERE l.artist_id = a.id) - $3::int),
 		         (a.verification = 'verified') DESC, followers DESC, a.name, a.id
 		LIMIT $4`, id, genres, followers, intParam(r, "limit", 12, 1, 50))
 	if err != nil {

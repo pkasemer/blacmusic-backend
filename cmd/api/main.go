@@ -15,6 +15,7 @@ import (
 
 	"github.com/blacmusic/backend/internal/config"
 	"github.com/blacmusic/backend/internal/db"
+	"github.com/blacmusic/backend/internal/genre"
 	"github.com/blacmusic/backend/internal/mailer"
 	"github.com/blacmusic/backend/internal/server"
 	"github.com/blacmusic/backend/internal/source"
@@ -48,6 +49,7 @@ func run() error {
 	if err := db.Migrate(ctx, pool); err != nil {
 		return err
 	}
+	go genre.Watch(ctx, pool, 30*time.Second) // the team manages the genres
 
 	redisOpts, err := redis.ParseURL(cfg.RedisURL)
 	if err != nil {

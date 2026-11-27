@@ -14,12 +14,15 @@ import (
 	"github.com/blacmusic/backend/internal/auth"
 	"github.com/blacmusic/backend/internal/httpx"
 	"github.com/blacmusic/backend/internal/image"
+	"github.com/blacmusic/backend/internal/review"
 )
 
 // Handler serves PATCH /v1/me.
 type Handler struct {
 	pool *pgxpool.Pool
 	auth *auth.Service
+	// Review: an artist's new picture is shown to listeners only once the team approves it.
+	Review bool
 }
 
 // NewHandler creates the handler.
@@ -65,10 +68,23 @@ func (h *Handler) Update(w http.ResponseWriter, r *http.Request) {
 		avatar = req.AvatarImageID
 	}
 
-	if _, err := h.pool.Exec(r.Context(), `
-		UPDATE users SET display_name = COALESCE($2, display_name),
-		                 avatar_image_id = CASE WHEN $3 THEN $4 ELSE avatar_image_id END
-		WHERE id = $1`, uid, name, setAvatar, avatar); err != nil {
+	err := func() error {
+		tx, err := h.pool.Begin(r.Context())
+		if err != nil {
+			return err
+		}
+		defer tx.Rollback(r.Context()) //nolint:errcheck
+		if _, err := tx.Exec(r.Context(), `UPDATE users SET display_name = COALESCE($2, display_name) WHERE id = $1`, uid, name); err != nil {
+			return err
+		}
+		if setAvatar {
+			if err := review.SetPicture(r.Context(), tx, uid, avatar, h.Review); err != nil {
+				return err
+			}
+		}
+		return tx.Commit(r.Context())
+	}()
+	if err != nil {
 		slog.Error("update profile", "err", err)
 		httpx.Error(w, http.StatusInternalServerError, "internal", "something went wrong")
 		return

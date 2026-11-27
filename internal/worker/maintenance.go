@@ -11,6 +11,7 @@ import (
 	"github.com/jackc/pgx/v5/pgxpool"
 
 	"github.com/blacmusic/backend/internal/image"
+	"github.com/blacmusic/backend/internal/listening"
 	"github.com/blacmusic/backend/internal/media"
 	"github.com/blacmusic/backend/internal/release"
 	"github.com/blacmusic/backend/internal/storage"
@@ -81,7 +82,13 @@ func (m *Maintenance) RunOnce(ctx context.Context) {
 	}
 
 	m.backfillLoudness(ctx, 3)
+	if _, err := image.MeasureStored(ctx, m.pool, m.blobs, 25); err != nil && ctx.Err() == nil {
+		slog.Warn("picture sizes not measured", "err", err)
+	}
 	m.purgeSearches(ctx)
+	if _, err := listening.RefreshDue(ctx, m.pool, 10); err != nil && ctx.Err() == nil {
+		slog.Error("refresh your sound playlists", "err", err)
+	}
 
 	if n, err := image.ExpireUnused(ctx, m.pool, m.blobs, 24*time.Hour); err != nil {
 		if ctx.Err() == nil {

@@ -18,6 +18,7 @@ import (
 
 	"github.com/blacmusic/backend/internal/artist"
 	"github.com/blacmusic/backend/internal/media"
+	"github.com/blacmusic/backend/internal/review"
 )
 
 // Status is where an upload is in its life.
@@ -37,6 +38,11 @@ const (
 	// MaxDailyUnverified caps how many uploads an artist without the verified
 	// badge may start in 24 hours. It limits damage from throwaway accounts.
 	MaxDailyUnverified = 30
+
+	// HeartbeatEvery is how often a worker says it is still on the upload it is processing.
+	HeartbeatEvery = 30 * time.Second
+	// StuckAfter without that signal means no worker is on the upload any more: it is stuck.
+	StuckAfter = 3 * time.Minute
 )
 
 var (
@@ -79,6 +85,7 @@ type Upload struct {
 	Status      Status
 	Error       string
 	Attempts    int
+	ClaimedAt   *time.Time // when a worker picked it up; nil unless it is being processed
 	CreatedAt   time.Time
 	UpdatedAt   time.Time
 }
@@ -89,6 +96,8 @@ type Store struct {
 	// OnReady, when set, is told (inside the transaction that finishes the last unfinished upload of a
 	// release) that the release's audio is all processed. The worker sets it.
 	OnReady ReadyHook
+	// Review: a song an artist adds to an online release stays hidden until the team approves it.
+	Review bool
 }
 
 // ReadyEvent says that every file uploaded to a release has been processed.
@@ -99,6 +108,7 @@ type ReadyEvent struct {
 	OwnerUserID  string
 	Tracks       int  // tracks in the release now
 	Live         bool // the release is already public
+	Held         bool // the new songs wait for the team's review
 }
 
 // ReadyHook receives a ReadyEvent inside the finishing transaction. A failing hook is logged and
@@ -108,16 +118,16 @@ type ReadyHook func(ctx context.Context, tx pgx.Tx, e ReadyEvent) error
 // NewStore creates the store.
 func NewStore(pool *pgxpool.Pool) *Store { return &Store{pool: pool} }
 
-const cols = `id, user_id::text, COALESCE(artist_id, ''), COALESCE(release_id, ''), track_id, title, artist_name, album_title,
+const cols = `id, COALESCE(user_id::text, ''), COALESCE(artist_id, ''), COALESCE(release_id, ''), track_id, title, artist_name, album_title,
 	genre, track_number, explicit, filename, size_bytes, original_key, multipart_id, part_size, status, COALESCE(error, ''),
-	attempts, created_at, updated_at`
+	attempts, claimed_at, created_at, updated_at`
 
 func scan(row pgx.Row) (*Upload, error) {
 	var u Upload
 	var st string
 	err := row.Scan(&u.ID, &u.UserID, &u.ArtistID, &u.ReleaseID, &u.TrackID, &u.Title, &u.ArtistName, &u.AlbumTitle,
 		&u.Genre, &u.TrackNumber, &u.Explicit, &u.Filename, &u.SizeBytes, &u.OriginalKey, &u.MultipartID, &u.PartSize, &st, &u.Error, &u.Attempts,
-		&u.CreatedAt, &u.UpdatedAt)
+		&u.ClaimedAt, &u.CreatedAt, &u.UpdatedAt)
 	if errors.Is(err, pgx.ErrNoRows) {
 		return nil, ErrNotFound
 	}
@@ -219,15 +229,20 @@ func (s *Store) Create(ctx context.Context, n NewUpload) (*Upload, error) {
 	if err != nil {
 		return nil, err
 	}
+	if !n.AsAdmin {
+		if err := review.Locked(ctx, tx, releaseID); err != nil {
+			return nil, err
+		}
+	}
 
 	u, err := scan(tx.QueryRow(ctx, `
 		WITH ids AS (SELECT 'upl_' || replace(gen_random_uuid()::text, '-', '') AS id)
 		INSERT INTO uploads (id, user_id, artist_id, release_id, title, artist_name, album_title, genre, track_number,
-		                     explicit, filename, size_bytes, original_key, rights_terms_version, rights_accepted_at, part_size)
-		SELECT ids.id, $1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, 'originals/' || ids.id, $12, now(), $13 FROM ids
+		                     explicit, filename, size_bytes, original_key, rights_terms_version, rights_accepted_at, part_size, by_team, quota_exempt)
+		SELECT ids.id, $1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, 'originals/' || ids.id, $12, now(), $13, $14, $15 FROM ids
 		RETURNING `+cols,
 		n.UserID, artistID, releaseID, n.Title, artistName, releaseTitle, n.Genre, n.TrackNumber, n.Explicit,
-		n.Filename, n.SizeBytes, n.TermsVersion, n.PartSize))
+		n.Filename, n.SizeBytes, n.TermsVersion, n.PartSize, n.AsAdmin, !owned)) // no account, no allowance to use
 	if err != nil {
 		return nil, err
 	}
@@ -412,7 +427,7 @@ func (s *Store) Claim(ctx context.Context, staleAfter time.Duration, maxAttempts
 		return nil, err
 	}
 	u, err := scan(s.pool.QueryRow(ctx, `
-		UPDATE uploads SET status = 'processing', attempts = attempts + 1, locked_at = now(), updated_at = now()
+		UPDATE uploads SET status = 'processing', attempts = attempts + 1, locked_at = now(), claimed_at = now(), updated_at = now()
 		WHERE id = (
 			SELECT id FROM uploads
 			WHERE (status = 'queued'
@@ -432,10 +447,41 @@ func (s *Store) Claim(ctx context.Context, staleAfter time.Duration, maxAttempts
 	return u, err
 }
 
+// Heartbeat says that the worker which claimed u is still on it. It returns false once the job is no longer that
+// worker's: it finished, failed, was removed, or was restarted.
+func (s *Store) Heartbeat(ctx context.Context, u *Upload) (bool, error) {
+	tag, err := s.pool.Exec(ctx, `
+		UPDATE uploads SET locked_at = now()
+		WHERE id = $1 AND status = 'processing' AND claimed_at IS NOT DISTINCT FROM $2`, u.ID, u.ClaimedAt)
+	return tag.RowsAffected() == 1, err
+}
+
+// TakenOver says whether the job was restarted since u was claimed, so the worker holding u must not touch it or
+// its file: it is waiting again, another worker has it, or another worker already finished it.
+func (s *Store) TakenOver(ctx context.Context, u *Upload) (bool, error) {
+	var over bool
+	err := s.pool.QueryRow(ctx, `
+		SELECT status IN ('queued', 'ready') OR (status = 'processing' AND claimed_at IS DISTINCT FROM $2)
+		FROM uploads WHERE id = $1`, u.ID, u.ClaimedAt).Scan(&over)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return false, nil
+	}
+	return over, err
+}
+
+// Restart queues an upload again with all its tries, inside the caller's transaction. The caller has locked the
+// row and decided that restarting it is right.
+func Restart(ctx context.Context, tx pgx.Tx, id string) error {
+	_, err := tx.Exec(ctx, `
+		UPDATE uploads SET status = 'queued', attempts = 0, error = NULL, locked_at = NULL, claimed_at = NULL, updated_at = now()
+		WHERE id = $1`, id)
+	return err
+}
+
 // Requeue puts a job back after a transient failure.
 func (s *Store) Requeue(ctx context.Context, id string) error {
 	_, err := s.pool.Exec(ctx, `
-		UPDATE uploads SET status = 'queued', locked_at = NULL, updated_at = now()
+		UPDATE uploads SET status = 'queued', locked_at = NULL, claimed_at = NULL, updated_at = now()
 		WHERE id = $1 AND status = 'processing'`, id)
 	return err
 }
@@ -483,7 +529,7 @@ func (s *Store) Finish(ctx context.Context, u *Upload, res Result) error {
 	defer tx.Rollback(ctx) //nolint:errcheck
 
 	var releaseVisibility string
-	err = tx.QueryRow(ctx, `SELECT visibility FROM albums WHERE id = $1 AND artist_id = $2 FOR SHARE`, u.ReleaseID, u.ArtistID).
+	err = tx.QueryRow(ctx, `SELECT visibility FROM albums WHERE id = $1 AND artist_id = $2 FOR UPDATE`, u.ReleaseID, u.ArtistID).
 		Scan(&releaseVisibility)
 	if errors.Is(err, pgx.ErrNoRows) {
 		return ErrReleaseGone
@@ -491,8 +537,14 @@ func (s *Store) Finish(ctx context.Context, u *Upload, res Result) error {
 	if err != nil {
 		return err
 	}
+	hold := false
+	if s.Review && releaseVisibility != "draft" {
+		if err := tx.QueryRow(ctx, `SELECT NOT by_team FROM uploads WHERE id = $1`, u.ID).Scan(&hold); err != nil {
+			return err
+		}
+	}
 	trackVisibility := "draft"
-	if releaseVisibility == "public" {
+	if releaseVisibility == "public" && !hold {
 		trackVisibility = "public"
 	}
 
@@ -507,6 +559,14 @@ func (s *Store) Finish(ctx context.Context, u *Upload, res Result) error {
 		u.TrackID, u.Title, u.ArtistID, u.ReleaseID, res.DurationMs, u.Explicit, u.Genre, u.TrackNumber, trackVisibility,
 		lufs, peak, lra); err != nil {
 		return err
+	}
+	if hold {
+		if _, err := tx.Exec(ctx, `UPDATE tracks SET review_hold = true WHERE id = $1`, u.TrackID); err != nil {
+			return err
+		}
+		if err := review.Stage(ctx, tx, u.ReleaseID, func(c *review.Changes) { c.NewTracks = append(c.NewTracks, u.TrackID) }); err != nil {
+			return err
+		}
 	}
 	// Legacy single-file pointer: keeps the track visible to native search and
 	// gives playback something to serve if renditions were ever lost.
@@ -531,7 +591,7 @@ func (s *Store) Finish(ctx context.Context, u *Upload, res Result) error {
 	// Only the worker that still owns the job may finish it.
 	tag, err := tx.Exec(ctx, `
 		UPDATE uploads SET status = 'ready', error = NULL, locked_at = NULL, updated_at = now()
-		WHERE id = $1 AND status = 'processing'`, u.ID)
+		WHERE id = $1 AND status = 'processing' AND claimed_at IS NOT DISTINCT FROM $2`, u.ID, u.ClaimedAt)
 	if err != nil {
 		return err
 	}
@@ -539,15 +599,15 @@ func (s *Store) Finish(ctx context.Context, u *Upload, res Result) error {
 		return fmt.Errorf("upload %s is no longer being processed", u.ID)
 	}
 	if s.OnReady != nil {
-		s.notifyReady(ctx, tx, u, releaseVisibility == "public")
+		s.notifyReady(ctx, tx, u, releaseVisibility == "public" && !hold, hold)
 	}
 	return tx.Commit(ctx)
 }
 
 // notifyReady calls OnReady when this was the last unfinished upload of a release that belongs to no
 // transfer (transfers report on their own).
-func (s *Store) notifyReady(ctx context.Context, tx pgx.Tx, u *Upload, live bool) {
-	ev := ReadyEvent{UploadID: u.ID, ReleaseID: u.ReleaseID, Live: live}
+func (s *Store) notifyReady(ctx context.Context, tx pgx.Tx, u *Upload, live, held bool) {
+	ev := ReadyEvent{UploadID: u.ID, ReleaseID: u.ReleaseID, Live: live, Held: held}
 	err := tx.QueryRow(ctx, `
 		SELECT al.title, a.owner_user_id::text, (SELECT count(*) FROM tracks WHERE album_id = al.id)
 		FROM albums al JOIN artists a ON a.id = al.artist_id

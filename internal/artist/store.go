@@ -14,6 +14,7 @@ import (
 	"github.com/jackc/pgx/v5/pgxpool"
 
 	"github.com/blacmusic/backend/internal/image"
+	"github.com/blacmusic/backend/internal/review"
 )
 
 var (
@@ -39,6 +40,8 @@ type Store struct {
 	pool      *pgxpool.Pool
 	freeBytes int64
 	publicURL string // API base URL, for image links
+	// Review: an artist's new or changed profile waits for the team before listeners see it.
+	Review bool
 }
 
 // NewStore creates the store. freeBytes is the storage every new artist starts with.
@@ -111,6 +114,14 @@ func (s *Store) Get(ctx context.Context, id, viewer string) (*Artist, error) {
 	if err != nil {
 		return nil, err
 	}
+	// a new profile nobody has approved is its owner's alone
+	var hidden bool
+	if err := s.pool.QueryRow(ctx, `SELECT approved_at IS NULL AND owner_user_id::text IS DISTINCT FROM $2 FROM artists WHERE id = $1`, id, viewer).Scan(&hidden); err != nil {
+		return nil, err
+	}
+	if hidden {
+		return nil, ErrNotFound
+	}
 	return a, s.markFollowing(ctx, a, viewer)
 }
 
@@ -134,6 +145,13 @@ func (s *Store) markFollowing(ctx context.Context, a *Artist, viewer string) err
 // Follow adds the artist to the user's followed artists (the same list as
 // PUT /v1/me/library/artists/{id}). Following twice is fine.
 func (s *Store) Follow(ctx context.Context, userID, artistID string) error {
+	var followable bool // a suspended profile cannot gain followers
+	if err := s.pool.QueryRow(ctx, `SELECT EXISTS (SELECT 1 FROM artists WHERE id = $1 AND banned_at IS NULL AND approved_at IS NOT NULL)`, artistID).Scan(&followable); err != nil {
+		return err
+	}
+	if !followable {
+		return ErrNotFound
+	}
 	_, err := s.pool.Exec(ctx,
 		`INSERT INTO library_artists (user_id, artist_id) VALUES ($1, $2) ON CONFLICT DO NOTHING`, userID, artistID)
 	var pgErr *pgconn.PgError
@@ -186,9 +204,10 @@ func (s *Store) Create(ctx context.Context, userID, name, bio string) (*Artist, 
 
 	var id string
 	err = tx.QueryRow(ctx, `
-		INSERT INTO artists (name, bio, owner_user_id, flagged)
-		VALUES ($1, $2, $3, EXISTS (SELECT 1 FROM artists WHERE verification = 'verified' AND lower(name) = lower($1)))
-		RETURNING id`, name, bio, userID).Scan(&id)
+		INSERT INTO artists (name, bio, owner_user_id, flagged, approved_at)
+		VALUES ($1, $2, $3, EXISTS (SELECT 1 FROM artists WHERE verification = 'verified' AND lower(name) = lower($1)),
+		        CASE WHEN $4 THEN NULL ELSE now() END)
+		RETURNING id`, name, bio, userID, s.Review).Scan(&id)
 	var pgErr *pgconn.PgError
 	if errors.As(err, &pgErr) && pgErr.Code == "23505" {
 		return nil, ErrExists
@@ -202,10 +221,27 @@ func (s *Store) Create(ctx context.Context, userID, name, bio string) (*Artist, 
 			return nil, err
 		}
 	}
+	if s.Review {
+		if err := review.SubmitProfile(ctx, tx, id); err != nil {
+			return nil, err
+		}
+	}
 	if err := tx.Commit(ctx); err != nil {
 		return nil, err
 	}
 	return s.Get(ctx, id, userID)
+}
+
+// GrantWelcome gives an artist the free starting allowance, once in its life (handing a catalog artist to a second
+// person does not add another).
+func (s *Store) GrantWelcome(ctx context.Context, tx pgx.Tx, artistID string) error {
+	if s.freeBytes <= 0 {
+		return nil
+	}
+	_, err := tx.Exec(ctx, `INSERT INTO storage_grants (artist_id, kind, bytes, note)
+		SELECT $1, 'free', $2, 'welcome allowance' WHERE NOT EXISTS (SELECT 1 FROM storage_grants WHERE artist_id = $1 AND kind = 'free')`,
+		artistID, s.freeBytes)
+	return err
 }
 
 // Patch holds the editable profile fields; nil means "leave unchanged".
@@ -225,43 +261,42 @@ func (s *Store) Update(ctx context.Context, id, userID string, p Patch) (*Artist
 	defer tx.Rollback(ctx) //nolint:errcheck
 
 	var name, bio, verification string
-	err = tx.QueryRow(ctx, `SELECT name, bio, verification FROM artists
-		WHERE id = $1 AND owner_user_id = $2 FOR UPDATE`, id, userID).Scan(&name, &bio, &verification)
+	var approved bool
+	err = tx.QueryRow(ctx, `SELECT name, bio, verification, approved_at IS NOT NULL FROM artists
+		WHERE id = $1 AND owner_user_id = $2 FOR UPDATE`, id, userID).Scan(&name, &bio, &verification, &approved)
 	if errors.Is(err, pgx.ErrNoRows) {
 		return nil, ErrNotFound
 	}
 	if err != nil {
 		return nil, err
 	}
+	held := s.Review && approved
 
-	renamed := false
+	renamed, removedBio := false, false
+	var wantName, wantBio *string // what was sent, when it must wait
 	if p.Name != nil {
 		n := strings.TrimSpace(*p.Name)
 		if !validName(n) {
 			return nil, &ValidationError{"name must be 1-100 characters"}
 		}
-		renamed = n != name
-		name = n
+		if held {
+			wantName = &n
+		} else {
+			renamed = n != name
+			name = n
+		}
 	}
 	if p.Bio != nil {
 		b := strings.TrimSpace(*p.Bio)
 		if utf8.RuneCountInString(b) > 1000 {
 			return nil, &ValidationError{"bio must be at most 1000 characters"}
 		}
-		bio = b
-	}
-	// Kept for older clients: the artist picture IS the user's profile picture,
-	// so this sets the user's avatar (same as PATCH /v1/me).
-	if p.AvatarImageID != nil {
-		var newAvatar *string
-		if *p.AvatarImageID != "" {
-			if err := image.CheckOwned(ctx, tx, *p.AvatarImageID, userID, "avatar"); err != nil {
-				return nil, &ValidationError{"avatarImageId must be one of your finished avatar images"}
-			}
-			newAvatar = p.AvatarImageID
-		}
-		if _, err := tx.Exec(ctx, `UPDATE users SET avatar_image_id = $2 WHERE id = $1`, userID, newAvatar); err != nil {
-			return nil, err
+		switch {
+		case held && b != "":
+			wantBio = &b
+		default: // taking the bio away never waits
+			removedBio = held
+			bio = b
 		}
 	}
 	if renamed && verification == "verified" {
@@ -273,6 +308,47 @@ func (s *Store) Update(ctx context.Context, id, userID string, p Patch) (*Artist
 		                                           AND lower(v.name) = lower($2) AND v.id <> $1) ELSE flagged END
 		WHERE id = $1`, id, name, bio, verification, renamed); err != nil {
 		return nil, err
+	}
+	if held && (wantName != nil || wantBio != nil || removedBio) {
+		// a value sent as it already is stops waiting
+		if err := review.StageProfile(ctx, tx, id, func(w *review.Profile) {
+			if wantName != nil {
+				w.Name = wantName
+				if *wantName == name {
+					w.Name = nil
+				}
+			}
+			if wantBio != nil {
+				w.Bio = wantBio
+				if *wantBio == bio {
+					w.Bio = nil
+				}
+			}
+			if removedBio {
+				w.Bio = nil
+			}
+		}); err != nil {
+			return nil, err
+		}
+	}
+	if s.Review && !approved && (p.Name != nil || p.Bio != nil) {
+		if err := review.SubmitProfile(ctx, tx, id); err != nil {
+			return nil, err
+		}
+	}
+	// Kept for older clients: the artist picture IS the user's profile picture,
+	// so this sets the user's avatar (same as PATCH /v1/me).
+	if p.AvatarImageID != nil {
+		var newAvatar *string
+		if *p.AvatarImageID != "" {
+			if err := image.CheckOwned(ctx, tx, *p.AvatarImageID, userID, "avatar"); err != nil {
+				return nil, &ValidationError{"avatarImageId must be one of your finished avatar images"}
+			}
+			newAvatar = p.AvatarImageID
+		}
+		if err := review.SetPicture(ctx, tx, userID, newAvatar, s.Review); err != nil {
+			return nil, err
+		}
 	}
 	if err := tx.Commit(ctx); err != nil {
 		return nil, err
@@ -339,7 +415,7 @@ func QuotaFor(ctx context.Context, q Querier, artistID string) (*Quota, error) {
 		  COALESCE((SELECT sum(bytes) FROM storage_grants WHERE artist_id = $1 AND kind IN ('purchase','adjustment')
 		            AND (expires_at IS NULL OR expires_at > now())), 0),
 		  COALESCE((SELECT sum(size_bytes) FROM uploads WHERE artist_id = $1
-		            AND status IN ('pending','queued','processing','ready')), 0)`, artistID).
+		            AND status IN ('pending','queued','processing','ready') AND NOT quota_exempt), 0)`, artistID).
 		Scan(&out.FreeStorageBytes, &out.PurchasedStorageBytes, &out.UsedStorageBytes)
 	if err != nil {
 		return nil, err

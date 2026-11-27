@@ -4,13 +4,17 @@ package credits
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
+	"slices"
 	"strconv"
 	"strings"
 	"unicode/utf8"
 
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
+
+	"github.com/blacmusic/backend/internal/review"
 )
 
 // Limits and roles.
@@ -61,7 +65,11 @@ type Input struct {
 }
 
 // Store reads and writes credits.
-type Store struct{ pool *pgxpool.Pool }
+type Store struct {
+	pool *pgxpool.Pool
+	// Review: an artist's changes to the credits of an online release wait for the team.
+	Review bool
+}
 
 // NewStore creates the store.
 func NewStore(pool *pgxpool.Pool) *Store { return &Store{pool: pool} }
@@ -88,7 +96,7 @@ func scanCredits(rows pgx.Rows, scope func(c *Credit)) ([]Credit, error) {
 func (s *Store) visibleRelease(ctx context.Context, releaseID, viewer string) error {
 	var ok bool
 	err := s.pool.QueryRow(ctx, `
-		SELECT al.visibility = 'public' OR a.owner_user_id::text = $2
+		SELECT al.visibility = 'public' OR COALESCE(a.owner_user_id::text = $2, false) -- a catalog artist has no owner
 		FROM albums al LEFT JOIN artists a ON a.id = al.artist_id WHERE al.id = $1`, releaseID, viewer).Scan(&ok)
 	if errors.Is(err, pgx.ErrNoRows) || (err == nil && !ok) {
 		return ErrNotFound
@@ -219,10 +227,83 @@ func (s *Store) Replace(ctx context.Context, releaseID, userID string, in []Inpu
 		return nil, err
 	}
 	defer tx.Rollback(ctx) //nolint:errcheck
-	if _, err := tx.Exec(ctx, `DELETE FROM release_credits WHERE release_id = $1`, releaseID); err != nil {
+	var visibility string
+	if err := tx.QueryRow(ctx, `SELECT visibility FROM albums WHERE id = $1 FOR UPDATE`, releaseID).Scan(&visibility); err != nil {
 		return nil, err
 	}
-	for i, c := range clean {
+	if err := review.Locked(ctx, tx, releaseID); err != nil {
+		return nil, err
+	}
+	// removing every credit is taking something down: it never waits
+	if s.Review && visibility != "draft" && len(clean) > 0 {
+		raw, err := json.Marshal(clean)
+		if err != nil {
+			return nil, err
+		}
+		same, err := unchanged(ctx, tx, releaseID, clean)
+		if err != nil {
+			return nil, err
+		}
+		if err := review.Stage(ctx, tx, releaseID, func(c *review.Changes) {
+			c.Credits = raw
+			if same {
+				c.Credits = nil
+			}
+		}); err != nil {
+			return nil, err
+		}
+		if err := tx.Commit(ctx); err != nil {
+			return nil, err
+		}
+		list, _, err := s.OwnerList(ctx, releaseID, userID)
+		return list, err
+	}
+	if err := Write(ctx, tx, releaseID, clean); err != nil {
+		return nil, err
+	}
+	if err := review.Alter(ctx, tx, releaseID, func(c *review.Changes) { c.Credits = nil }); err != nil {
+		return nil, err
+	}
+	if err := tx.Commit(ctx); err != nil {
+		return nil, err
+	}
+	return s.ForRelease(ctx, releaseID, userID)
+}
+
+// unchanged says whether a list is the one the release has.
+func unchanged(ctx context.Context, tx pgx.Tx, releaseID string, list []Input) (bool, error) {
+	rows, err := tx.Query(ctx, `SELECT name, role, role_label, COALESCE(track_id, ''), COALESCE(artist_id, '')
+		FROM release_credits WHERE release_id = $1 ORDER BY position, created_at, id`, releaseID)
+	if err != nil {
+		return false, err
+	}
+	have, err := pgx.CollectRows(rows, func(r pgx.CollectableRow) (c Input, err error) {
+		return c, r.Scan(&c.Name, &c.Role, &c.RoleLabel, &c.TrackID, &c.ArtistID)
+	})
+	return slices.Equal(have, list), err
+}
+
+// Write makes list the release's credits, inside the caller's transaction. The list has been checked; a credit for a
+// song that has since left the release is left out.
+func Write(ctx context.Context, tx pgx.Tx, releaseID string, list []Input) error {
+	// features the team attached stay the team's when the list is saved with them still in it
+	rows, err := tx.Query(ctx, `SELECT COALESCE(track_id, '') || '|' || artist_id FROM release_credits
+		WHERE release_id = $1 AND role = 'featured_artist' AND by_team AND artist_id IS NOT NULL`, releaseID)
+	if err != nil {
+		return err
+	}
+	keys, err := pgx.CollectRows(rows, pgx.RowTo[string])
+	if err != nil {
+		return err
+	}
+	team := map[string]bool{}
+	for _, k := range keys {
+		team[k] = true
+	}
+	if _, err := tx.Exec(ctx, `DELETE FROM release_credits WHERE release_id = $1`, releaseID); err != nil {
+		return err
+	}
+	for i, c := range list {
 		var track, artist *string
 		if c.TrackID != "" {
 			track = &c.TrackID
@@ -231,15 +312,58 @@ func (s *Store) Replace(ctx context.Context, releaseID, userID string, in []Inpu
 			artist = &c.ArtistID
 		}
 		if _, err := tx.Exec(ctx, `
-			INSERT INTO release_credits (release_id, track_id, name, role, role_label, artist_id, position)
-			VALUES ($1, $2, $3, $4, $5, $6, $7)`, releaseID, track, c.Name, c.Role, c.RoleLabel, artist, i); err != nil {
-			return nil, err
+			INSERT INTO release_credits (release_id, track_id, name, role, role_label, artist_id, position, by_team)
+			SELECT $1, $2::text, $3, $4, $5, (SELECT id FROM artists WHERE id = $6::text), $7, $8
+			WHERE $2::text IS NULL OR EXISTS (SELECT 1 FROM tracks WHERE id = $2::text AND album_id = $1)`,
+			releaseID, track, c.Name, c.Role, c.RoleLabel, artist, i,
+			c.Role == "featured_artist" && team[c.TrackID+"|"+c.ArtistID]); err != nil {
+			return err
 		}
 	}
-	if err := tx.Commit(ctx); err != nil {
-		return nil, err
+	return nil
+}
+
+// OwnerList is the release's credits as its owner last sent them (waiting changes included), with what is waiting or
+// was refused; info is nil for anyone else and when nothing is.
+func (s *Store) OwnerList(ctx context.Context, releaseID, viewer string) ([]Credit, *review.Info, error) {
+	list, err := s.ForRelease(ctx, releaseID, viewer)
+	if err != nil {
+		return nil, nil, err
 	}
-	return s.ForRelease(ctx, releaseID, userID)
+	var owned bool
+	if err := s.pool.QueryRow(ctx, `SELECT EXISTS (SELECT 1 FROM albums al JOIN artists a ON a.id = al.artist_id
+		WHERE al.id = $1 AND a.owner_user_id::text = $2)`, releaseID, viewer).Scan(&owned); err != nil || !owned {
+		return list, nil, err
+	}
+	info, row, err := review.ForOwner(ctx, s.pool, releaseID)
+	if err != nil || info == nil || row.Kind != "update" || len(row.Changes.Credits) == 0 {
+		return list, nil, err
+	}
+	if row.Status != "pending" {
+		return list, info, nil // refused: back to the approved list, with why
+	}
+	var waiting []Input
+	if err := json.Unmarshal(row.Changes.Credits, &waiting); err != nil {
+		return nil, nil, err
+	}
+	titles := map[string]string{}
+	rows, err := s.pool.Query(ctx, `SELECT id, title FROM tracks WHERE album_id = $1`, releaseID)
+	if err != nil {
+		return nil, nil, err
+	}
+	defer rows.Close()
+	for rows.Next() {
+		var id, title string
+		if err := rows.Scan(&id, &title); err != nil {
+			return nil, nil, err
+		}
+		titles[id] = title
+	}
+	out := make([]Credit, len(waiting))
+	for i, c := range waiting {
+		out[i] = Credit{Name: c.Name, Role: c.Role, RoleLabel: c.RoleLabel, TrackID: c.TrackID, TrackTitle: titles[c.TrackID], ArtistID: c.ArtistID}
+	}
+	return out, info, rows.Err()
 }
 
 // Suggest lists names the user's artist has credited before (most used first) that contain q.

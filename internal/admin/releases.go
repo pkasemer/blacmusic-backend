@@ -20,6 +20,7 @@ import (
 func (h *Handler) releaseRoutes(r chi.Router) {
 	r.Get("/releases", h.listReleases)
 	r.Get("/releases/{id}", h.getRelease)
+	r.Post("/releases/combine", h.combineReleases)
 	r.Patch("/releases/{id}", h.patchRelease)
 	r.Post("/releases/{id}/takedown", h.takedownRelease)
 	r.Post("/releases/{id}/restore", h.restoreRelease)
@@ -27,6 +28,7 @@ func (h *Handler) releaseRoutes(r chi.Router) {
 	r.Delete("/releases/{id}", h.deleteRelease)
 	r.Patch("/tracks/{id}", h.patchTrack)
 	r.Delete("/tracks/{id}", h.deleteTrack)
+	r.Post("/tracks/{id}/single", h.splitTrack)
 }
 
 type releaseRow struct {
@@ -41,11 +43,14 @@ type releaseRow struct {
 	PreviousVisibility string     `json:"previousVisibility,omitempty"`
 	TrackCount         int        `json:"trackCount"`
 	CoverURL           string     `json:"coverUrl,omitempty"`
+	Featured           bool       `json:"featured"`
 	PublishedAt        *time.Time `json:"publishedAt"`
 	CreatedAt          time.Time  `json:"createdAt"`
 }
 
-// GET /v1/admin/releases?q=&visibility=draft|scheduled|public&takenDown=true|false&artistId=&type=single|album&limit=&offset=
+// GET /v1/admin/releases?q=&visibility=draft|scheduled|public&takenDown=true|false&artistId=&type=single|album&featured=true|false&limit=&offset=
+// featured=true lists the featured releases in their order; otherwise newest first.
+// metadata=not_started|in_progress|completed and pendingReview=true|false filter by the songs' catalogue metadata.
 // Includes drafts and taken-down releases. visibility is the stored state, which is "draft" for a taken-down
 // release (that is how it is hidden): previousVisibility says what it was before the takedown.
 func (h *Handler) listReleases(w http.ResponseWriter, r *http.Request) {
@@ -66,31 +71,71 @@ func (h *Handler) listReleases(w http.ResponseWriter, r *http.Request) {
 		reply(w, fail4(http.StatusBadRequest, "bad_request", "takenDown must be true or false"))
 		return
 	}
+	order := "al.created_at DESC, al.id"
+	switch q.Get("featured") {
+	case "", "false":
+	case "true":
+		order = "al.featured_position, al.id"
+	default:
+		reply(w, fail4(http.StatusBadRequest, "bad_request", "featured must be true or false"))
+		return
+	}
+	switch q.Get("metadata") {
+	case "", "not_started", "in_progress", "completed":
+	default:
+		reply(w, fail4(http.StatusBadRequest, "bad_request", "metadata must be not_started, in_progress or completed"))
+		return
+	}
+	if v := q.Get("pendingReview"); v != "" && v != "true" && v != "false" {
+		reply(w, fail4(http.StatusBadRequest, "bad_request", "pendingReview must be true or false"))
+		return
+	}
 	limit, offset := page(r)
 	search := strings.TrimSpace(q.Get("q"))
 	where := ` WHERE ($1 = '' OR al.title ILIKE $2 OR a.name ILIKE $2 OR al.id = $1) AND ($3 = '' OR al.visibility = $3)
-		AND ($4 = '' OR ($4 = 'true') = (al.taken_down_at IS NOT NULL)) AND ($5 = '' OR al.artist_id = $5) AND ($6 = '' OR al.release_type = $6)`
-	args := []any{search, like(search), q.Get("visibility"), q.Get("takenDown"), q.Get("artistId"), q.Get("type")}
+		AND ($4 = '' OR ($4 = 'true') = (al.taken_down_at IS NOT NULL)) AND ($5 = '' OR al.artist_id = $5) AND ($6 = '' OR al.release_type = $6)
+		AND ($7 = '' OR ($7 = 'true') = (al.featured_position IS NOT NULL))
+		AND ($8 = '' OR md.status = $8) AND ($9 = '' OR ($9 = 'true') = (md.pending > 0))`
+	// how far the catalogue metadata of a release's songs has come
+	const progress = ` CROSS JOIN LATERAL (
+		SELECT x.*, CASE WHEN x.total > 0 AND x.verified = x.total THEN 'completed' WHEN x.enriched = 0 THEN 'not_started' ELSE 'in_progress' END AS status
+		FROM (SELECT count(*) AS total, count(*) FILTER (WHERE s.status <> 'not_started') AS enriched,
+		             count(*) FILTER (WHERE s.status = 'pending_review') AS pending, count(*) FILTER (WHERE s.status = 'verified') AS verified
+		      FROM tracks t JOIN track_metadata_state s ON s.track_id = t.id WHERE t.album_id = al.id) x) md`
+	args := []any{search, like(search), q.Get("visibility"), q.Get("takenDown"), q.Get("artistId"), q.Get("type"), q.Get("featured"), q.Get("metadata"), q.Get("pendingReview")}
 	var total int
-	if err := h.pool.QueryRow(r.Context(), `SELECT count(*) FROM albums al LEFT JOIN artists a ON a.id = al.artist_id`+where, args...).Scan(&total); err != nil {
+	if err := h.pool.QueryRow(r.Context(), `SELECT count(*) FROM albums al LEFT JOIN artists a ON a.id = al.artist_id`+progress+where, args...).Scan(&total); err != nil {
 		reply(w, err)
 		return
 	}
 	rows, err := h.pool.Query(r.Context(), `
 		SELECT al.id, al.title, al.release_type, COALESCE(a.id, ''), COALESCE(a.name, ''), al.visibility, al.taken_down_at IS NOT NULL,
 		       COALESCE(al.taken_down_prev_visibility, ''), (SELECT count(*) FROM tracks t WHERE t.album_id = al.id),
-		       COALESCE(al.artwork_url, ''), al.published_at, al.created_at
-		FROM albums al LEFT JOIN artists a ON a.id = al.artist_id`+where+` ORDER BY al.created_at DESC, al.id LIMIT $7 OFFSET $8`, append(args, limit, offset)...)
+		       COALESCE(al.artwork_url, ''), al.published_at, al.created_at, al.featured_position IS NOT NULL,
+		       to_char(al.release_date, 'YYYY-MM-DD'), md.total, md.enriched, md.pending, md.verified, md.status
+		FROM albums al LEFT JOIN artists a ON a.id = al.artist_id`+progress+where+` ORDER BY `+order+` LIMIT $10 OFFSET $11`, append(args, limit, offset)...)
 	if err != nil {
 		reply(w, err)
 		return
 	}
 	defer rows.Close()
-	out := []releaseRow{}
+	type listed struct {
+		releaseRow
+		ReleaseDate *string `json:"releaseDate"`
+		Metadata    struct {
+			Total         int    `json:"total"`
+			Enriched      int    `json:"enriched"`
+			PendingReview int    `json:"pendingReview"`
+			Verified      int    `json:"verified"`
+			Status        string `json:"status"`
+		} `json:"metadata"`
+	}
+	out := []listed{}
 	for rows.Next() {
-		var x releaseRow
+		var x listed
 		if err := rows.Scan(&x.ID, &x.Title, &x.Type, &x.ArtistID, &x.ArtistName, &x.Visibility, &x.TakenDown, &x.PreviousVisibility,
-			&x.TrackCount, &x.CoverURL, &x.PublishedAt, &x.CreatedAt); err != nil {
+			&x.TrackCount, &x.CoverURL, &x.PublishedAt, &x.CreatedAt, &x.Featured,
+			&x.ReleaseDate, &x.Metadata.Total, &x.Metadata.Enriched, &x.Metadata.PendingReview, &x.Metadata.Verified, &x.Metadata.Status); err != nil {
 			reply(w, err)
 			return
 		}
@@ -112,6 +157,7 @@ type trackRow struct {
 	Visibility  string `json:"visibility"`
 	Explicit    bool   `json:"explicit"`
 	Genre       string `json:"genre"`
+	HasLyrics   bool   `json:"hasLyrics"`
 }
 
 // GET /v1/admin/releases/{id}: the release as its owner sees it (any visibility), its tracks and takedown information.
@@ -138,11 +184,11 @@ func (h *Handler) getRelease(w http.ResponseWriter, r *http.Request) {
 		       COALESCE(al.taken_down_prev_visibility, ''), (SELECT count(*) FROM tracks t WHERE t.album_id = al.id), COALESCE(al.artwork_url, ''),
 		       al.published_at, al.created_at, al.description, al.genre, COALESCE(to_char(al.release_date, 'YYYY-MM-DD'), ''), al.publish_at, al.updated_at,
 		       al.taken_down_at, al.takedown_reason, COALESCE(al.taken_down_by::text, ''), COALESCE((SELECT email FROM users b WHERE b.id = al.taken_down_by), ''),
-		       al.taken_down_by_ban, COALESCE(a.banned_at IS NOT NULL, false)
+		       al.taken_down_by_ban, COALESCE(a.banned_at IS NOT NULL, false), al.featured_position IS NOT NULL
 		FROM albums al LEFT JOIN artists a ON a.id = al.artist_id WHERE al.id = $1`, id).
 		Scan(&d.ID, &d.Title, &d.Type, &d.ArtistID, &d.ArtistName, &d.Visibility, &d.TakenDown, &prev, &d.TrackCount, &d.CoverURL,
 			&d.PublishedAt, &d.CreatedAt, &d.Description, &d.Genre, &d.ReleaseDate, &d.PublishAt, &d.UpdatedAt,
-			&downAt, &reasonText, &byID, &byEmail, &byBan, &artistBanned)
+			&downAt, &reasonText, &byID, &byEmail, &byBan, &artistBanned, &d.Featured)
 	if err != nil {
 		reply(w, err)
 		return
@@ -160,7 +206,8 @@ func (h *Handler) getRelease(w http.ResponseWriter, r *http.Request) {
 		d.Takedown = map[string]any{"at": downAt, "reason": reasonText, "by": by, "previousVisibility": prev, "byBan": byBan}
 	}
 	d.Tracks = []trackRow{}
-	rows, err := h.pool.Query(ctx, `SELECT id, title, track_number, duration_ms, visibility, explicit, genre FROM tracks WHERE album_id = $1
+	rows, err := h.pool.Query(ctx, `SELECT id, title, track_number, duration_ms, visibility, explicit, genre,
+		EXISTS (SELECT 1 FROM track_lyrics tl WHERE tl.track_id = tracks.id) FROM tracks WHERE album_id = $1
 		ORDER BY track_number NULLS LAST, created_at, id`, id)
 	if err != nil {
 		reply(w, err)
@@ -170,7 +217,7 @@ func (h *Handler) getRelease(w http.ResponseWriter, r *http.Request) {
 	for rows.Next() {
 		var t trackRow
 		var g *string
-		if err := rows.Scan(&t.ID, &t.Title, &t.TrackNumber, &t.DurationMs, &t.Visibility, &t.Explicit, &g); err != nil {
+		if err := rows.Scan(&t.ID, &t.Title, &t.TrackNumber, &t.DurationMs, &t.Visibility, &t.Explicit, &g, &t.HasLyrics); err != nil {
 			reply(w, err)
 			return
 		}
@@ -269,7 +316,7 @@ func (h *Handler) patchRelease(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 	if in.Genre != nil {
-		ng, err := genre.Normalize(strings.TrimSpace(*in.Genre))
+		ng, err := genre.NormalizeChange(strings.TrimSpace(*in.Genre), g)
 		if err != nil {
 			reply(w, invalid(err.Error()))
 			return
@@ -385,7 +432,7 @@ func (h *Handler) patchTrack(w http.ResponseWriter, r *http.Request) {
 		t.Explicit = *in.Explicit
 	}
 	if in.Genre != nil {
-		ng, err := genre.Normalize(strings.TrimSpace(*in.Genre))
+		ng, err := genre.NormalizeChange(strings.TrimSpace(*in.Genre), t.Genre)
 		if err != nil {
 			reply(w, invalid(err.Error()))
 			return

@@ -26,6 +26,7 @@ func (h *Handler) overview(w http.ResponseWriter, r *http.Request) {
 		Shows    map[string]int `json:"shows"`
 		Plays    map[string]int `json:"plays"`
 		Storage  int64          `json:"storageBytes"`
+		Reviews  map[string]int `json:"reviews"`
 	}
 	var u, uv, ub, u7, u30, a, av, ap, ab, rt, rp, rd, rs, rtd, tr, sh, pt, p7, p30, pu int
 	err := h.pool.QueryRow(r.Context(), `
@@ -49,6 +50,12 @@ func (h *Handler) overview(w http.ResponseWriter, r *http.Request) {
 		reply(w, err)
 		return
 	}
+	var waiting int
+	if err := h.pool.QueryRow(r.Context(), `SELECT (SELECT count(*) FROM release_reviews WHERE status = 'pending') + (SELECT count(*) FROM artist_reviews WHERE status = 'pending')`).Scan(&waiting); err != nil {
+		reply(w, err)
+		return
+	}
+	o.Reviews = map[string]int{"pending": waiting}
 	o.Users = map[string]int{"total": u, "verifiedEmail": uv, "banned": ub, "new7d": u7, "new30d": u30}
 	o.Artists = map[string]int{"total": a, "verified": av, "pendingVerification": ap, "banned": ab}
 	o.Releases = map[string]int{"total": rt, "public": rp, "draft": rd, "scheduled": rs, "takenDown": rtd}

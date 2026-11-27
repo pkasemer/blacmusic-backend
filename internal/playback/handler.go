@@ -41,7 +41,12 @@ const episodePrefix = "epi_"
 
 type candidate struct{ source, sourceID string }
 
-func (h *Handler) Resolve(w http.ResponseWriter, r *http.Request) {
+func (h *Handler) Resolve(w http.ResponseWriter, r *http.Request) { h.resolve(w, r, false) }
+
+// ResolveAny is Resolve for the team: any track, whatever its state. Only put it behind an administrator check.
+func (h *Handler) ResolveAny(w http.ResponseWriter, r *http.Request) { h.resolve(w, r, true) }
+
+func (h *Handler) resolve(w http.ResponseWriter, r *http.Request, every bool) {
 	trackID := chi.URLParam(r, "id")
 	quality, ok := media.ParseQuality(r.URL.Query().Get("quality"))
 	if !ok {
@@ -57,7 +62,7 @@ func (h *Handler) Resolve(w http.ResponseWriter, r *http.Request) {
 		cands = []candidate{{source: "podcast", sourceID: trackID}} // episodes have exactly one source
 	} else {
 		uid, _ := auth.UserID(r.Context())
-		cands, err = h.candidates(r.Context(), trackID, uid)
+		cands, err = h.candidates(r.Context(), trackID, uid, every)
 	}
 	if err != nil {
 		slog.Error("playback candidates", "err", err)
@@ -96,14 +101,14 @@ func (h *Handler) Resolve(w http.ResponseWriter, r *http.Request) {
 }
 
 // candidates lists a track's sources. A track that is not public is playable
-// only by the artist who owns it (to preview a draft).
-func (h *Handler) candidates(ctx context.Context, trackID, viewer string) ([]candidate, error) {
+// only by the artist who owns it (to preview a draft), and by the team (every).
+func (h *Handler) candidates(ctx context.Context, trackID, viewer string, every bool) ([]candidate, error) {
 	rows, err := h.pool.Query(ctx, `
 		SELECT ts.source, ts.source_id FROM track_sources ts
 		JOIN tracks t ON t.id = ts.track_id
 		LEFT JOIN artists a ON a.id = t.artist_id
-		WHERE ts.track_id = $1 AND (t.visibility = 'public' OR a.owner_user_id::text = $2)
-		ORDER BY ts.priority, ts.source`, trackID, viewer)
+		WHERE ts.track_id = $1 AND ($3 OR t.visibility = 'public' OR a.owner_user_id::text = $2)
+		ORDER BY ts.priority, ts.source`, trackID, viewer, every)
 	if err != nil {
 		return nil, err
 	}

@@ -36,7 +36,8 @@ type Config struct {
 	PollInterval     time.Duration
 	Concurrency      int
 	MaxAttempts      int           // tries before a job is failed for good (default 3)
-	StaleAfter       time.Duration // a job processing longer than this is presumed dead (default 45m)
+	StaleAfter       time.Duration // a job not heard from for this long is presumed dead (default 45m)
+	HeartbeatEvery   time.Duration // how often a running job says so (default upload.HeartbeatEvery)
 }
 
 // Worker pulls jobs from the upload queue.
@@ -53,6 +54,9 @@ func New(store *upload.Store, blobs Blobs, cfg Config) *Worker {
 	}
 	if cfg.StaleAfter <= 0 {
 		cfg.StaleAfter = cfg.TranscodeTimeout + 15*time.Minute
+	}
+	if cfg.HeartbeatEvery <= 0 {
+		cfg.HeartbeatEvery = upload.HeartbeatEvery
 	}
 	if cfg.PollInterval <= 0 {
 		cfg.PollInterval = 2 * time.Second
@@ -97,11 +101,27 @@ func (w *Worker) loop(ctx context.Context) {
 func (w *Worker) handle(ctx context.Context, u *upload.Upload) {
 	log := slog.With("upload", u.ID, "track", u.TrackID, "attempt", u.Attempts)
 	start := time.Now()
-	err := w.Process(ctx, u)
+	jobCtx, stop := context.WithCancel(ctx)
+	beating := make(chan struct{})
+	go func() {
+		defer close(beating)
+		w.keepAlive(jobCtx, u, stop)
+	}()
+	err := w.Process(jobCtx, u)
+	stop()
+	<-beating
 
 	// Bookkeeping must survive a shutdown signal.
 	bg, cancel := context.WithTimeout(context.WithoutCancel(ctx), 15*time.Second)
 	defer cancel()
+
+	if err != nil {
+		// a job restarted from the dashboard belongs to its new claim: leave it and its file alone
+		if over, terr := w.store.TakenOver(bg, u); terr == nil && over {
+			log.Warn("upload was restarted while this worker had it; stopping", "err", err)
+			return
+		}
+	}
 
 	var invalid *media.InvalidMediaError
 	switch {
@@ -212,6 +232,30 @@ func (w *Worker) Process(ctx context.Context, u *upload.Upload) error {
 		return fmt.Errorf("finish: %w", err)
 	}
 	return nil
+}
+
+// keepAlive tells the queue every so often that the job is still being worked on, which is how the dashboard tells
+// a running job from a stuck one. It calls stop when the job stops being this worker's.
+func (w *Worker) keepAlive(ctx context.Context, u *upload.Upload, stop context.CancelFunc) {
+	t := time.NewTicker(w.cfg.HeartbeatEvery)
+	defer t.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-t.C:
+		}
+		held, err := w.store.Heartbeat(ctx, u)
+		switch {
+		case err != nil:
+			if ctx.Err() == nil {
+				slog.Warn("upload heartbeat", "upload", u.ID, "err", err)
+			}
+		case !held:
+			stop()
+			return
+		}
+	}
 }
 
 func sleep(ctx context.Context, d time.Duration) {

@@ -66,26 +66,15 @@ var All = []Genre{
 	{"taarab", "Taarab"},
 	{"lo-fi", "Lo-fi"},
 	{"ambient", "Ambient"},
+	{"kadongo-kamu", "Kadongo Kamu"},
+	{"traditional", "Traditional"},
 	{"other", "Other"},
 }
 
-var byKey = func() map[string]Genre {
-	m := make(map[string]Genre, len(All)*2)
-	for _, g := range All {
-		m[strings.ToLower(g.Name)] = g
-		m[g.ID] = g
-	}
-	// other common spellings
-	for alias, id := range map[string]string{"hip hop": "hip-hop-rap", "hip-hop": "hip-hop-rap", "hiphop": "hip-hop-rap"} {
-		m[alias] = m[id]
-	}
-	return m
-}()
-
 // Lookup finds a genre by display name or id, ignoring case and surrounding space.
 func Lookup(s string) (Genre, bool) {
-	g, ok := byKey[strings.ToLower(strings.TrimSpace(s))]
-	return g, ok
+	e, ok := current.Load().byKey[strings.ToLower(strings.TrimSpace(s))]
+	return e.Genre, ok
 }
 
 // Normalize returns the canonical display name for a genre given by name or id.
@@ -95,15 +84,15 @@ func Normalize(s string) (string, error) {
 	if s == "" {
 		return "", nil
 	}
-	g, ok := Lookup(s)
-	if !ok {
+	e, ok := current.Load().byKey[strings.ToLower(s)]
+	if !ok || !e.active {
 		return "", ErrInvalid
 	}
-	return g.Name, nil
+	return e.Name, nil
 }
 
 // List serves GET /v1/genres. The list rarely changes, so clients may cache it.
 func List(w http.ResponseWriter, _ *http.Request) {
-	w.Header().Set("Cache-Control", "private, max-age=86400")
-	httpx.JSON(w, http.StatusOK, map[string]any{"genres": All})
+	w.Header().Set("Cache-Control", "private, max-age=3600")
+	httpx.JSON(w, http.StatusOK, map[string]any{"genres": current.Load().list})
 }

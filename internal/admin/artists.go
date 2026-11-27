@@ -24,6 +24,8 @@ func (h *Handler) artistRoutes(r chi.Router) {
 	r.Post("/artists/{id}/unban", h.unbanArtist)
 	r.Get("/artists/{id}/deletion-preview", h.artistDeletionPreview)
 	r.Delete("/artists/{id}", h.deleteArtist)
+	r.Post("/artists/{id}/owner", h.assignOwner)
+	r.Delete("/artists/{id}/owner", h.removeOwner)
 }
 
 type artistRow struct {
@@ -160,12 +162,12 @@ func (h *Handler) getArtist(w http.ResponseWriter, r *http.Request) {
 	if owner != "" {
 		a.Owner = map[string]any{"id": owner, "email": ownerEmail, "displayName": ownerName}
 	}
-	q, err := artist.QuotaFor(ctx, h.pool, id)
+	storage, err := h.artistStorage(ctx, id)
 	if err != nil {
 		reply(w, err)
 		return
 	}
-	a.Storage = map[string]any{"usedBytes": q.UsedStorageBytes, "quotaBytes": q.TotalStorageBytes}
+	a.Storage = storage
 	a.Counts = map[string]int{}
 	var releases, public, tracks, followers, plays int
 	if err := h.pool.QueryRow(ctx, `
@@ -197,6 +199,66 @@ func (h *Handler) getArtist(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	httpx.JSON(w, http.StatusOK, a)
+}
+
+type filesAndBytes struct {
+	Files int   `json:"files"`
+	Bytes int64 `json:"bytes"`
+}
+
+// storageBreakdown says everything an artist keeps on the server. The first three are the audio originals: together
+// they are usedBytes (charged to the allowance) plus teamUploadBytes (not charged). Playback copies and pictures take
+// disk space but are never charged.
+type storageBreakdown struct {
+	PublishedAudio    filesAndBytes `json:"publishedAudio"`    // originals whose release is public now
+	UnpublishedAudio  filesAndBytes `json:"unpublishedAudio"`  // originals whose release is a draft, scheduled or taken down
+	UnfinishedUploads filesAndBytes `json:"unfinishedUploads"` // not processed yet, at the reserved size
+	PlaybackAudio     filesAndBytes `json:"playbackAudio"`     // the copies the app plays
+	Pictures          filesAndBytes `json:"pictures"`          // pictures in use: the artist's and every release cover
+}
+
+// artistStorage reads the allowance and the breakdown from one snapshot, so the parts match the total even while
+// uploads are being processed.
+func (h *Handler) artistStorage(ctx context.Context, id string) (map[string]any, error) {
+	tx, err := h.pool.BeginTx(ctx, pgx.TxOptions{IsoLevel: pgx.RepeatableRead, AccessMode: pgx.ReadOnly})
+	if err != nil {
+		return nil, err
+	}
+	defer tx.Rollback(ctx) //nolint:errcheck
+	q, err := artist.QuotaFor(ctx, tx, id)
+	if err != nil {
+		return nil, err
+	}
+	var b storageBreakdown
+	if err := tx.QueryRow(ctx, `
+		SELECT count(*) FILTER (WHERE u.status = 'ready' AND al.visibility = 'public'),
+		       COALESCE(sum(u.size_bytes) FILTER (WHERE u.status = 'ready' AND al.visibility = 'public'), 0),
+		       count(*) FILTER (WHERE u.status = 'ready' AND al.visibility IS DISTINCT FROM 'public'),
+		       COALESCE(sum(u.size_bytes) FILTER (WHERE u.status = 'ready' AND al.visibility IS DISTINCT FROM 'public'), 0),
+		       count(*) FILTER (WHERE u.status <> 'ready'),
+		       COALESCE(sum(u.size_bytes) FILTER (WHERE u.status <> 'ready'), 0)
+		FROM uploads u LEFT JOIN albums al ON al.id = u.release_id
+		WHERE u.artist_id = $1 AND u.status IN ('pending', 'queued', 'processing', 'ready')`, id).
+		Scan(&b.PublishedAudio.Files, &b.PublishedAudio.Bytes, &b.UnpublishedAudio.Files, &b.UnpublishedAudio.Bytes,
+			&b.UnfinishedUploads.Files, &b.UnfinishedUploads.Bytes); err != nil {
+		return nil, err
+	}
+	if err := tx.QueryRow(ctx, `SELECT count(*), COALESCE(sum(tr.size_bytes), 0) FROM track_renditions tr JOIN tracks t ON t.id = tr.track_id
+		WHERE t.artist_id = $1`, id).Scan(&b.PlaybackAudio.Files, &b.PlaybackAudio.Bytes); err != nil {
+		return nil, err
+	}
+	if err := tx.QueryRow(ctx, `
+		SELECT count(*), COALESCE(sum(stored_bytes), 0) FROM images WHERE id IN (
+			SELECT COALESCE(u.avatar_image_id, a.avatar_image_id) FROM artists a LEFT JOIN users u ON u.id = a.owner_user_id WHERE a.id = $1
+			UNION SELECT cover_image_id FROM albums WHERE artist_id = $1)`, id).Scan(&b.Pictures.Files, &b.Pictures.Bytes); err != nil {
+		return nil, err
+	}
+	var team int64 // originals that are not charged to the allowance
+	if err := tx.QueryRow(ctx, `SELECT COALESCE(sum(size_bytes), 0) FROM uploads
+		WHERE artist_id = $1 AND quota_exempt AND status IN ('pending', 'queued', 'processing', 'ready')`, id).Scan(&team); err != nil {
+		return nil, err
+	}
+	return map[string]any{"usedBytes": q.UsedStorageBytes, "quotaBytes": q.TotalStorageBytes, "teamUploadBytes": team, "breakdown": b}, nil
 }
 
 type grantRow struct {

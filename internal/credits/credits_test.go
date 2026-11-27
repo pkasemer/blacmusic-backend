@@ -1,4 +1,4 @@
-package credits
+package credits_test
 
 import (
 	"bytes"
@@ -14,6 +14,7 @@ import (
 
 	"github.com/blacmusic/backend/internal/auth"
 	"github.com/blacmusic/backend/internal/blobtest"
+	. "github.com/blacmusic/backend/internal/credits"
 	"github.com/blacmusic/backend/internal/release"
 	"github.com/blacmusic/backend/internal/testutil"
 	"github.com/blacmusic/backend/internal/trackview"

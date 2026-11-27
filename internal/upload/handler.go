@@ -13,9 +13,11 @@ import (
 
 	"github.com/go-chi/chi/v5"
 
+	"github.com/blacmusic/backend/internal/artist"
 	"github.com/blacmusic/backend/internal/auth"
 	"github.com/blacmusic/backend/internal/genre"
 	"github.com/blacmusic/backend/internal/httpx"
+	"github.com/blacmusic/backend/internal/review"
 	"github.com/blacmusic/backend/internal/storage"
 )
 
@@ -165,8 +167,11 @@ func (h *Handler) start(w http.ResponseWriter, r *http.Request, uid string, req 
 				"limitBytes": quota.Limit, "usedBytes": quota.Used,
 			})
 		return nil, false
+	case errors.Is(err, review.ErrPending):
+		httpx.Error(w, http.StatusConflict, "review_pending", review.Message)
+		return nil, false
 	case errors.Is(err, ErrArtistBanned):
-		httpx.Error(w, http.StatusForbidden, "account_banned", "this artist profile has been suspended")
+		httpx.Error(w, http.StatusForbidden, artist.CodeSuspended, "this artist profile has been suspended")
 		return nil, false
 	case errors.Is(err, ErrNoArtist):
 		httpx.Error(w, http.StatusForbidden, "artist_required", "create your artist profile before uploading")

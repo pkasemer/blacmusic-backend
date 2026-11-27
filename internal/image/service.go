@@ -21,8 +21,19 @@ import (
 	"github.com/blacmusic/backend/internal/storage"
 )
 
-// MaxImagesPerUser bounds pending and finished images per account.
+// MaxImagesPerUser bounds the pictures of an account that nothing uses (waiting for their file, or finished and
+// not attached). Pictures in use do not count, so releasing more music never uses up the allowance. Unused ones are
+// cleared after a day (ExpireUnused). Administrators have no limit.
 const MaxImagesPerUser = 50
+
+// notInUse is true for an image (alias i) that nothing shows. The limit and the clean-up share it, so a new place
+// that shows pictures must be added here, or its pictures would be deleted.
+const notInUse = `NOT EXISTS (SELECT 1 FROM users u WHERE u.avatar_image_id = i.id)
+	AND NOT EXISTS (SELECT 1 FROM users nu WHERE nu.next_avatar_image_id = i.id)
+	AND NOT EXISTS (SELECT 1 FROM artists a WHERE a.avatar_image_id = i.id)
+	AND NOT EXISTS (SELECT 1 FROM albums al WHERE al.cover_image_id = i.id)
+	AND NOT EXISTS (SELECT 1 FROM playlists pl WHERE pl.cover_image_id = i.id)
+	AND NOT EXISTS (SELECT 1 FROM release_reviews rr WHERE rr.status = 'pending' AND rr.changes->'release'->>'coverImageId' = i.id)`
 
 const uploadTTL = 15 * time.Minute
 
@@ -42,11 +53,12 @@ type Handler struct {
 	blobs     Blobs
 	publicURL string
 	sem       chan struct{} // decoding a big image takes ~100 MB; allow two at a time
+	mosaics   *mosaicCache
 }
 
 // NewHandler creates the handler.
 func NewHandler(pool *pgxpool.Pool, blobs Blobs, publicURL string) *Handler {
-	return &Handler{pool: pool, blobs: blobs, publicURL: publicURL, sem: make(chan struct{}, 2)}
+	return &Handler{pool: pool, blobs: blobs, publicURL: publicURL, sem: make(chan struct{}, 2), mosaics: newMosaicCache()}
 }
 
 // Routes registers the authenticated routes (mounted at /v1/images).
@@ -59,6 +71,7 @@ func (h *Handler) Routes(r chi.Router) {
 // are unguessable and hold only avatars and covers.
 func (h *Handler) ServeRoute(r chi.Router) {
 	r.Get("/{id}/{file}", h.serve)
+	r.Get("/mosaic/{ids}/{file}", h.serveMosaic) // four covers as one
 }
 
 func originalKey(id string) string      { return "images/originals/" + id }
@@ -113,10 +126,11 @@ func (h *Handler) create(w http.ResponseWriter, r *http.Request) {
 		WITH n AS (SELECT 'img_' || replace(gen_random_uuid()::text, '-', '') AS id)
 		INSERT INTO images (id, owner_id, purpose, original_key, size_bytes)
 		SELECT n.id, $1, $2, 'images/originals/' || n.id, $3 FROM n
-		WHERE (SELECT count(*) FROM images WHERE owner_id = $1 AND status IN ('pending','ready')) < $4
+		WHERE EXISTS (SELECT 1 FROM users WHERE id = $1 AND role = 'admin')
+		   OR (SELECT count(*) FROM images i WHERE i.owner_id = $1 AND i.status IN ('pending','ready') AND `+notInUse+`) < $4
 		RETURNING id`, uid, req.Purpose, req.SizeBytes, MaxImagesPerUser).Scan(&id)
 	if errors.Is(err, pgx.ErrNoRows) {
-		httpx.Error(w, http.StatusConflict, "limit_reached", "too many images; delete unused ones first")
+		httpx.Error(w, http.StatusConflict, "limit_reached", "too many unused pictures; they are cleared after a day, then try again")
 		return
 	}
 	if err != nil {
@@ -146,7 +160,7 @@ func (h *Handler) complete(w http.ResponseWriter, r *http.Request) {
 
 	var purpose, status, owner string
 	var width, height *int
-	err := h.pool.QueryRow(r.Context(), `SELECT purpose, status, owner_id::text, width, height FROM images WHERE id = $1`, id).
+	err := h.pool.QueryRow(r.Context(), `SELECT purpose, status, COALESCE(owner_id::text, ''), width, height FROM images WHERE id = $1`, id).
 		Scan(&purpose, &status, &owner, &width, &height)
 	if errors.Is(err, pgx.ErrNoRows) || (err == nil && owner != uid) {
 		httpx.Error(w, http.StatusNotFound, "not_found", "image not found")
@@ -207,8 +221,8 @@ func (h *Handler) complete(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 	}
-	if _, err := h.pool.Exec(r.Context(), `UPDATE images SET status = 'ready', width = $2, height = $3 WHERE id = $1`,
-		id, res.Width, res.Height); err != nil {
+	if _, err := h.pool.Exec(r.Context(), `UPDATE images SET status = 'ready', width = $2, height = $3, stored_bytes = $4 WHERE id = $1`,
+		id, res.Width, res.Height, storedSize(res.Variants)); err != nil {
 		serverError(w, err)
 		return
 	}
@@ -332,10 +346,7 @@ func ExpireUnused(ctx context.Context, pool *pgxpool.Pool, blobs interface {
 		DELETE FROM images i
 		WHERE i.status IN ('ready', 'failed')
 		  AND i.created_at < now() - make_interval(secs => $1)
-		  AND NOT EXISTS (SELECT 1 FROM users u  WHERE u.avatar_image_id = i.id)
-		  AND NOT EXISTS (SELECT 1 FROM artists a WHERE a.avatar_image_id = i.id)
-		  AND NOT EXISTS (SELECT 1 FROM albums al WHERE al.cover_image_id = i.id)
-		  AND NOT EXISTS (SELECT 1 FROM playlists pl WHERE pl.cover_image_id = i.id)
+		  AND `+notInUse+`
 		RETURNING i.id`, olderThan.Seconds())
 	if err != nil {
 		return 0, err
@@ -372,9 +383,9 @@ func Ingest(ctx context.Context, pool *pgxpool.Pool, blobs Blobs, ownerID, purpo
 	var id string
 	err = pool.QueryRow(ctx, `
 		WITH n AS (SELECT 'img_' || replace(gen_random_uuid()::text, '-', '') AS id)
-		INSERT INTO images (id, owner_id, purpose, original_key, size_bytes, status, width, height)
-		SELECT n.id, $1, $2, 'images/originals/' || n.id, $3, 'ready', $4, $5 FROM n
-		RETURNING id`, ownerID, purpose, len(raw), res.Width, res.Height).Scan(&id)
+		INSERT INTO images (id, owner_id, purpose, original_key, size_bytes, status, width, height, stored_bytes)
+		SELECT n.id, $1, $2, 'images/originals/' || n.id, $3, 'ready', $4, $5, $6 FROM n
+		RETURNING id`, ownerID, purpose, len(raw), res.Width, res.Height, storedSize(res.Variants)).Scan(&id)
 	if err != nil {
 		return "", err
 	}
@@ -396,26 +407,25 @@ func Ingest(ctx context.Context, pool *pgxpool.Pool, blobs Blobs, ownerID, purpo
 	return id, nil
 }
 
-// Purge deletes every image a user owns: the stored files first, then the rows.
-// It is part of deleting an account and safe to run again.
+// Purge deletes the images a user owns that nothing else needs: the stored files first, then the rows. A picture
+// that stays on show without them (a cover or picture of an artist that remains, another person's playlist) is
+// kept; it loses its owner when the account goes. It is part of deleting an account and safe to run again.
 func Purge(ctx context.Context, pool *pgxpool.Pool, blobs interface {
 	Remove(ctx context.Context, key string) error
 }, ownerID string) error {
-	rows, err := pool.Query(ctx, `SELECT id FROM images WHERE owner_id = $1`, ownerID)
+	rows, err := pool.Query(ctx, `
+		SELECT i.id FROM images i WHERE i.owner_id = $1::uuid
+		  AND NOT EXISTS (SELECT 1 FROM users u WHERE u.avatar_image_id = i.id AND u.id <> $1::uuid)
+		  AND NOT EXISTS (SELECT 1 FROM artists a WHERE a.avatar_image_id = i.id
+		                  AND NOT (a.owner_user_id IS NOT DISTINCT FROM $1::uuid AND a.assigned_at IS NULL))
+		  AND NOT EXISTS (SELECT 1 FROM albums al WHERE al.cover_image_id = i.id
+		                  AND NOT EXISTS (SELECT 1 FROM artists a WHERE a.id = al.artist_id AND a.owner_user_id = $1::uuid AND a.assigned_at IS NULL))
+		  AND NOT EXISTS (SELECT 1 FROM playlists p WHERE p.cover_image_id = i.id AND p.owner_id <> $1::uuid)`, ownerID)
 	if err != nil {
 		return err
 	}
-	var ids []string
-	for rows.Next() {
-		var id string
-		if err := rows.Scan(&id); err != nil {
-			rows.Close()
-			return err
-		}
-		ids = append(ids, id)
-	}
-	rows.Close()
-	if err := rows.Err(); err != nil {
+	ids, err := pgx.CollectRows(rows, pgx.RowTo[string])
+	if err != nil {
 		return err
 	}
 	for _, id := range ids {
@@ -424,6 +434,6 @@ func Purge(ctx context.Context, pool *pgxpool.Pool, blobs interface {
 		}
 		_ = blobs.Remove(ctx, originalKey(id))
 	}
-	_, err = pool.Exec(ctx, `DELETE FROM images WHERE owner_id = $1`, ownerID)
+	_, err = pool.Exec(ctx, `DELETE FROM images WHERE id = ANY($1)`, ids)
 	return err
 }

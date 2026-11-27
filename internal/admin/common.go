@@ -19,6 +19,7 @@ import (
 	"github.com/blacmusic/backend/internal/genre"
 	"github.com/blacmusic/backend/internal/httpx"
 	"github.com/blacmusic/backend/internal/release"
+	"github.com/blacmusic/backend/internal/review"
 )
 
 // apiError is an error with the HTTP answer to give.
@@ -52,6 +53,8 @@ func reply(w http.ResponseWriter, err error) {
 		httpx.Error(w, http.StatusConflict, "busy", errBusy.Error())
 	case errors.Is(err, release.ErrNotFound):
 		httpx.Error(w, http.StatusNotFound, "not_found", "not found")
+	case errors.Is(err, review.ErrPending):
+		httpx.Error(w, http.StatusConflict, "review_pending", review.Message)
 	case errors.Is(err, release.ErrNoTracks):
 		httpx.Error(w, http.StatusUnprocessableEntity, "no_tracks", "the release has no finished tracks yet")
 	case errors.Is(err, release.ErrUploadsPending):

@@ -180,7 +180,7 @@ func (s *Service) Authenticate(ctx context.Context, email, password string) (*Us
 	var avatarID *string
 	var banned bool
 	err := s.pool.QueryRow(ctx,
-		`SELECT id, email, display_name, role, email_verified_at IS NOT NULL, avatar_image_id, created_at, password_hash,
+		`SELECT id, email, display_name, role, email_verified_at IS NOT NULL, COALESCE(next_avatar_image_id, avatar_image_id), created_at, password_hash,
 		        EXISTS (SELECT 1 FROM push_tokens p WHERE p.user_id = users.id), banned_at IS NOT NULL FROM users WHERE email=$1`, email).
 		Scan(&u.ID, &u.Email, &u.DisplayName, &u.Role, &u.EmailVerified, &avatarID, &u.CreatedAt, &hash, &u.PushEnabled, &banned)
 	if errors.Is(err, pgx.ErrNoRows) {
@@ -240,7 +240,7 @@ func (s *Service) Me(ctx context.Context, userID string) (*User, error) {
 	u := &User{}
 	var avatarID *string
 	err := s.pool.QueryRow(ctx,
-		`SELECT id, email, display_name, role, email_verified_at IS NOT NULL, avatar_image_id, created_at, password_hash <> $2,
+		`SELECT id, email, display_name, role, email_verified_at IS NOT NULL, COALESCE(next_avatar_image_id, avatar_image_id), created_at, password_hash <> $2,
 		        EXISTS (SELECT 1 FROM push_tokens p WHERE p.user_id = users.id) FROM users WHERE id=$1`, userID, noPassword).
 		Scan(&u.ID, &u.Email, &u.DisplayName, &u.Role, &u.EmailVerified, &avatarID, &u.CreatedAt, &u.HasPassword, &u.PushEnabled)
 	if errors.Is(err, pgx.ErrNoRows) {

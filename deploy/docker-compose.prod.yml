@@ -81,6 +81,7 @@ services:
       LEGAL_OPERATOR: ${LEGAL_OPERATOR:-Blac Music}          # named on /privacy and /terms
       LEGAL_CONTACT_EMAIL: ${LEGAL_CONTACT_EMAIL:-}          # contact address shown on /privacy and /terms
       TRUST_PROXY: "true"            # the port below is reachable only by nginx on this machine
+      RELEASE_REVIEW: ${RELEASE_REVIEW:-true}                # artists' releases and public changes wait for the team
       FREE_STORAGE_GB: ${FREE_STORAGE_GB:-1}
       SMTP_HOST: ${SMTP_HOST:-}
       SMTP_PORT: ${SMTP_PORT:-587}
@@ -108,8 +109,10 @@ services:
     mem_limit: 192m
     logging: *logging
 
-  # Transcoding (ffmpeg) is CPU heavy: it is kept to half a core and one job at
-  # a time so it cannot starve the other sites sharing this machine.
+  # Transcoding (ffmpeg) is CPU heavy. One conversion uses about one processor, so
+  # the worker runs two at a time and may use up to 1.5 of the server's 2
+  # processors. Its low cpu_shares (the default is 1024) mean the API, database and
+  # storage go first when they want the processor at the same moment.
   worker:
     image: blacmusic-worker:${TAG:-latest}
     restart: unless-stopped
@@ -124,7 +127,8 @@ services:
       S3_SECRET_KEY: ${RUSTFS_SECRET_KEY}
       S3_BUCKET: blac-media
       PUBLIC_API_URL: ${PUBLIC_API_URL}
-      WORKER_CONCURRENCY: "1"
+      WORKER_CONCURRENCY: "2"
+      RELEASE_REVIEW: ${RELEASE_REVIEW:-true}
       TRANSFER_CONCURRENCY: ${TRANSFER_CONCURRENCY:-1}
       YOUTUBE_AUDIO_FETCH: ${YOUTUBE_AUDIO_FETCH:-false}
       EXPO_ACCESS_TOKEN: ${EXPO_ACCESS_TOKEN:-}              # optional, only with "enhanced push security" in the Expo project
@@ -136,8 +140,9 @@ services:
       SMTP_FROM: ${SMTP_FROM:-Blac Music <no-reply@blacmusic.pkasemer.com>}
       PLUNK_API_KEY: ${PLUNK_API_KEY:-}
       MAIL_FROM: ${MAIL_FROM:-}
-    cpus: "0.5"
-    mem_limit: 512m
+    cpus: "1.5"
+    cpu_shares: 512
+    mem_limit: 768m
     logging: *logging
 
 volumes:

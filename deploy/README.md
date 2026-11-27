@@ -69,4 +69,5 @@ uptime check on `https://blacmusic.pkasemer.com/readyz`, and disk monitoring.
 ## Keeping the server healthy
 - **How it is doing:** the admin site reads `GET /v1/admin/system` (load, memory, disk, what the app stores, waiting work, alerts) and `GET /v1/admin/system/history`. The worker takes a reading every 5 minutes and keeps 30 days.
 - **Old versions:** `ship.sh` keeps the newest three backend images.
+- **Unknown requests:** `nginx/reject-unknown.conf` drops requests for the bare IP address or unknown names, so the server does not show which domains it hosts. Installation and undo steps are at the top of the file.
 - **Cleaning up:** `vps-cleanup.sh` (run `report` first; nothing changes without `--apply`). It tidies logs and caches, and retires the old Mwonya sites in separate steps: `mwonya-offline` (can be undone), then `backup-mwonya.sh` from your PC, then `mwonya-delete`. The usage is at the top of each script.

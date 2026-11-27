@@ -9,6 +9,7 @@ import (
 
 	"github.com/blacmusic/backend/internal/auth"
 	"github.com/blacmusic/backend/internal/httpx"
+	"github.com/blacmusic/backend/internal/review"
 )
 
 // Handler serves the lyrics endpoints (authenticated).
@@ -30,12 +31,20 @@ func (h *Handler) Routes(r chi.Router) {
 
 func (h *Handler) get(w http.ResponseWriter, r *http.Request) {
 	uid, _ := auth.UserID(r.Context())
-	l, err := h.store.Get(r.Context(), chi.URLParam(r, "id"), uid)
+	l, info, err := h.store.ForOwner(r.Context(), chi.URLParam(r, "id"), uid)
 	if err != nil {
 		fail(w, err)
 		return
 	}
-	httpx.JSON(w, http.StatusOK, map[string]any{"lyrics": l})
+	reply(w, l, info)
+}
+
+func reply(w http.ResponseWriter, l *Lyrics, info *review.Info) {
+	out := map[string]any{"lyrics": l}
+	if info != nil {
+		out["review"] = info
+	}
+	httpx.JSON(w, http.StatusOK, out)
 }
 
 func (h *Handler) put(w http.ResponseWriter, r *http.Request) {
@@ -50,7 +59,13 @@ func (h *Handler) put(w http.ResponseWriter, r *http.Request) {
 		fail(w, err)
 		return
 	}
-	httpx.JSON(w, http.StatusOK, map[string]any{"lyrics": l})
+	// the answer is what they sent, saying so when it waits
+	_, info, err := h.store.ForOwner(r.Context(), chi.URLParam(r, "id"), uid)
+	if err != nil && !errors.Is(err, ErrNotFound) {
+		fail(w, err)
+		return
+	}
+	reply(w, l, info)
 }
 
 func (h *Handler) remove(w http.ResponseWriter, r *http.Request) {
@@ -62,13 +77,24 @@ func (h *Handler) remove(w http.ResponseWriter, r *http.Request) {
 	w.WriteHeader(http.StatusNoContent)
 }
 
+// Invalid answers a refused save, with every wrong line when the lyrics are timed.
+func Invalid(w http.ResponseWriter, ve *ValidationError) {
+	if len(ve.Lines) == 0 {
+		httpx.Error(w, http.StatusUnprocessableEntity, "validation_error", ve.Msg)
+		return
+	}
+	httpx.ErrorDetails(w, http.StatusUnprocessableEntity, "validation_error", ve.Msg, map[string]any{"errors": ve.Lines})
+}
+
 func fail(w http.ResponseWriter, err error) {
 	var ve *ValidationError
 	switch {
+	case errors.Is(err, review.ErrPending):
+		httpx.Error(w, http.StatusConflict, "review_pending", review.Message)
 	case errors.Is(err, ErrNotFound):
 		httpx.Error(w, http.StatusNotFound, "not_found", "no lyrics for this track")
 	case errors.As(err, &ve):
-		httpx.Error(w, http.StatusUnprocessableEntity, "validation_error", ve.Msg)
+		Invalid(w, ve)
 	default:
 		slog.Error("lyrics", "err", err)
 		httpx.Error(w, http.StatusInternalServerError, "internal", "something went wrong")

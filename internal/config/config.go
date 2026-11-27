@@ -37,6 +37,7 @@ type Config struct {
 	AuthRateWindow time.Duration
 
 	// Uploads and the transcoding worker.
+	ReleaseReview      bool          // artists\' releases and public changes wait for the team (RELEASE_REVIEW, on by default)
 	UploadMaxBytes     int64         // largest accepted original
 	UploadPartBytes    int64         // size of each part of a resumable upload
 	UploadURLTTL       time.Duration // how long a presigned upload URL stays valid
@@ -226,6 +227,10 @@ func load(needJWT bool) (Config, error) {
 	}
 	if c.S3PublicHostFromRequest && c.Env == "production" {
 		return c, fmt.Errorf("S3_PUBLIC_HOST_FROM_REQUEST must not be enabled in production")
+	}
+	// what artists publish or change in public waits for the team unless this is switched off
+	if c.ReleaseReview, err = getBool("RELEASE_REVIEW", true); err != nil {
+		return c, err
 	}
 	if c.TrustProxy, err = getBool("TRUST_PROXY", false); err != nil {
 		return c, err

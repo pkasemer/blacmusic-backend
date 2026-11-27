@@ -102,6 +102,17 @@ type Track struct {
 	TruePeakDb   *float64 `json:"truePeakDb,omitempty"`
 	Source       string   `json:"source,omitempty"`
 	SourceID     string   `json:"sourceId,omitempty"`
+	// FeaturedArtists are shown after the main artist (ArtistName), in order; absent when there are none.
+	FeaturedArtists []FeaturedArtist `json:"featuredArtists,omitempty"`
+}
+
+// FeaturedArtist is one artist a song features. ArtistID (with a picture and the badge) is set only when the name
+// leads to that artist's profile.
+type FeaturedArtist struct {
+	ArtistID string `json:"artistId,omitempty"`
+	Name     string `json:"name"`
+	ImageURL string `json:"imageUrl,omitempty"`
+	Verified bool   `json:"verified"`
 }
 
 // Provider is one pluggable audio source.

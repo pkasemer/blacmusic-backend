@@ -54,7 +54,8 @@ type Playlist struct {
 	IsPublic    bool   `json:"isPublic"`
 	// IsFeatured marks playlists the Blac team curates (only public ones).
 	IsFeatured bool `json:"isFeatured"`
-	// ArtworkURL is the custom cover; absent when none was set.
+	// ArtworkURL is the custom cover. Without one, a playlist with four track covers gets them as one picture
+	// (see image.MosaicURLs); otherwise it is absent.
 	ArtworkURL string `json:"artworkUrl,omitempty"`
 	// ArtworkLargeURL is the custom cover at about 1280 px; absent when none was set.
 	ArtworkLargeURL string `json:"artworkLargeUrl,omitempty"`
@@ -114,8 +115,17 @@ func NewStore(pool *pgxpool.Pool, publicURL string) *Store {
 	return &Store{pool: pool, publicURL: publicURL}
 }
 
-// playlistSelect reads a playlist as seen by a viewer, who is always $1: the
-// owner sees every track, anyone else only the public ones.
+// removedTrack is true for a song that was removed from the service: its artist is banned, or an administrator
+// took its release down.
+const removedTrack = `(EXISTS (SELECT 1 FROM artists ba WHERE ba.id = t.artist_id AND ba.banned_at IS NOT NULL)
+	OR EXISTS (SELECT 1 FROM albums td WHERE td.id = t.album_id AND td.taken_down_at IS NOT NULL))`
+
+// seenTrack is what a viewer ($1) sees of a track in a playlist. Anyone sees public tracks. The playlist's owner
+// also sees the ones that are not public, except removed songs; the artist always sees their own.
+const seenTrack = `(t.visibility = 'public' OR (p.owner_id = $1 AND (NOT ` + removedTrack + `
+	OR EXISTS (SELECT 1 FROM artists oa WHERE oa.id = t.artist_id AND oa.owner_user_id = $1))))`
+
+// playlistSelect reads a playlist as seen by a viewer, who is always $1.
 const playlistSelect = `
 	SELECT p.id, p.owner_id::text, u.display_name, u.avatar_image_id,
 	       p.name, p.description, p.is_public, p.is_featured, p.cover_image_id,
@@ -124,16 +134,16 @@ const playlistSelect = `
 	           FROM playlist_items i
 	           JOIN tracks t        ON t.id  = i.track_id
 	           LEFT JOIN albums al  ON al.id = t.album_id
-	           WHERE i.playlist_id = p.id AND (t.visibility = 'public' OR p.owner_id = $1)
+	           WHERE i.playlist_id = p.id AND ` + seenTrack + `
 	             AND COALESCE(NULLIF(t.artwork_url, ''), NULLIF(al.artwork_url, '')) IS NOT NULL
 	           GROUP BY 1 ORDER BY 2 LIMIT 4) s ORDER BY s.pos),
 	       (SELECT count(*) FROM playlist_items i JOIN tracks t ON t.id = i.track_id
-	         WHERE i.playlist_id = p.id AND (t.visibility = 'public' OR p.owner_id = $1)),
+	         WHERE i.playlist_id = p.id AND ` + seenTrack + `),
 	       (SELECT count(*) FROM library_playlists l WHERE l.playlist_id = p.id),
 	       EXISTS (SELECT 1 FROM library_playlists l WHERE l.playlist_id = p.id AND l.user_id = $1),
 	       p.created_at, p.updated_at,
 	       (SELECT COALESCE(sum(t.duration_ms), 0) / 1000 FROM playlist_items i JOIN tracks t ON t.id = i.track_id
-	         WHERE i.playlist_id = p.id AND (t.visibility = 'public' OR p.owner_id = $1))
+	         WHERE i.playlist_id = p.id AND ` + seenTrack + `)
 	FROM playlists p
 	JOIN users u ON u.id = p.owner_id`
 
@@ -154,6 +164,14 @@ func (s *Store) scanPlaylist(row pgx.Row) (*Playlist, error) {
 	}
 	if p.ArtworkURLs == nil {
 		p.ArtworkURLs = []string{}
+	}
+	if p.ArtworkURL == "" && len(p.ArtworkURLs) == 4 {
+		// installed app versions draw their own four-cover grid wrongly, so they are given the picture ready made
+		if medium, large, ok := image.MosaicURLs(s.publicURL, p.ArtworkURLs); ok {
+			p.ArtworkURL, p.ArtworkLargeURL = medium, large
+		} else {
+			p.ArtworkURLs = p.ArtworkURLs[:1] // covers from elsewhere cannot be combined: one is shown on its own
+		}
 	}
 	return &p, nil
 }
@@ -286,7 +304,7 @@ const (
 	SortPopular  = "popular"
 )
 
-const saveCountExpr = `(SELECT count(*) FROM library_playlists l WHERE l.playlist_id = p.id)`
+const saveCountExpr = `(SELECT count(*) FROM signal_playlist_saves l WHERE l.playlist_id = p.id)`
 
 // Browse lists public playlists that have at least one public track.
 //
@@ -330,7 +348,7 @@ func (s *Store) ListSaved(ctx context.Context, viewer string, limit, offset int)
 
 // Get returns a playlist and a page of items. Private playlists are reported
 // as not found to anyone but the owner, who also is the only one to see tracks
-// that are not public yet.
+// that are not public yet (never removed ones, see seenTrack).
 func (s *Store) Get(ctx context.Context, id, viewer string, limit, offset int) (*Detail, error) {
 	p, err := s.scanPlaylist(s.pool.QueryRow(ctx, playlistSelect+` WHERE p.id = $2`, viewer, id))
 	if errors.Is(err, pgx.ErrNoRows) {
@@ -343,11 +361,14 @@ func (s *Store) Get(ctx context.Context, id, viewer string, limit, offset int) (
 		return nil, ErrNotFound
 	}
 
-	q := itemSelect + ` WHERE i.playlist_id = $1`
-	if p.OwnerID != viewer {
-		q += ` AND t.visibility = 'public'`
+	// the same rule as seenTrack; the items keep their stored positions, so hidden ones leave gaps
+	q := itemSelect + ` WHERE i.playlist_id = $1 AND t.visibility = 'public'`
+	args := []any{id, limit, offset}
+	if p.OwnerID == viewer {
+		q = itemSelect + ` WHERE i.playlist_id = $1 AND (t.visibility = 'public' OR NOT ` + removedTrack + ` OR a.owner_user_id::text = $4)`
+		args = append(args, viewer)
 	}
-	rows, err := s.pool.Query(ctx, q+` ORDER BY i.position LIMIT $2 OFFSET $3`, id, limit, offset)
+	rows, err := s.pool.Query(ctx, q+` ORDER BY i.position LIMIT $2 OFFSET $3`, args...)
 	if err != nil {
 		return nil, err
 	}

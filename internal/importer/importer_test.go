@@ -8,7 +8,10 @@ import (
 	"image/png"
 	"net/http"
 	"net/http/httptest"
+	"slices"
+	"strconv"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -618,5 +621,277 @@ func TestImportRefusalsAndCancelling(t *testing.T) {
 	v = f.drive(id, nil)
 	if v["status"] != "failed" || obj(list(v["errors"])[0])["code"] != "artist_banned" {
 		t.Fatalf("banned meanwhile = %v", v)
+	}
+}
+
+func TestListingUnfinishedImports(t *testing.T) {
+	f := setup(t)
+	ctx := context.Background()
+	// 25 jobs: more than the plain list shows. Started jobs get a start time out of step with their creation.
+	insert := func(owner, status string, created, started int) (id string) {
+		t.Helper()
+		if err := f.pool.QueryRow(ctx, `INSERT INTO import_jobs (created_by, idempotency_key, artist_name, release_type, publish, rights_basis, status, created_at, started_at)
+			VALUES ($1::uuid, $2, 'A', 'single', 'draft', 'test jobs', $3, now() - make_interval(mins => $4),
+			        CASE WHEN $5::int > 0 THEN now() - make_interval(mins => $5) END) RETURNING id`,
+			owner, testutil.Unique("list"), status, created, started).Scan(&id); err != nil {
+			t.Fatal(err)
+		}
+		return id
+	}
+	// the oldest-created jobs are the ones being worked on: the plain list would cut them off
+	servedSecond := insert(f.admin, "processing", 900, 10)
+	servedFirst := insert(f.admin, "processing", 800, 50)
+	waitingOld := insert(f.admin, "awaiting_files", 700, 0)
+	waitingNew := insert(f.admin, "awaiting_files", 600, 0)
+	var finished []string
+	for i := range 21 {
+		finished = append(finished, insert(f.admin, []string{"completed", "completed_with_errors", "failed", "cancelled"}[i%4], 100-i, 90-i))
+	}
+	other := testutil.User(t, f.pool, "admin", true)
+	theirs := insert(other, "processing", 5, 1)
+
+	ids := func(token, path string) (int, []string, []any) {
+		code, b := f.call("GET", path, token, "", nil)
+		var out []string
+		for _, raw := range list(b["imports"]) {
+			out = append(out, obj(raw)["jobId"].(string))
+		}
+		return code, out, list(b["imports"])
+	}
+	// jobs of other tests may be around: look only at ours
+	ours := map[string]bool{servedFirst: true, servedSecond: true, waitingOld: true, waitingNew: true, theirs: true}
+	for _, id := range finished {
+		ours[id] = true
+	}
+	only := func(all []string) (out []string) {
+		for _, id := range all {
+			if ours[id] {
+				out = append(out, id)
+			}
+		}
+		return out
+	}
+	_, plain, _ := ids(f.adminT, "/admin/imports")
+	if len(plain) != 20 || strings.Contains(strings.Join(plain, " "), servedFirst) {
+		t.Fatalf("the plain list = %d jobs", len(plain))
+	}
+	code, got, rows := ids(f.adminT, "/admin/imports?state=unfinished")
+	if want := []string{servedFirst, servedSecond, theirs, waitingOld, waitingNew}; code != 200 || strings.Join(only(got), " ") != strings.Join(want, " ") {
+		t.Fatalf("unfinished = %d %v, want %v", code, only(got), want)
+	}
+	for _, raw := range rows {
+		row := obj(raw)
+		if (row["status"] != "pending" && row["status"] != "processing") || row["results"] != nil {
+			t.Fatalf("row = %v", row)
+		}
+	}
+	// a key sees only its administrator's jobs
+	_, k := f.call("POST", "/admin/api-keys", f.adminT, "", map[string]any{"name": "lister"})
+	_, got, _ = ids(k["key"].(string), "/admin/imports?state=unfinished")
+	if want := []string{servedFirst, servedSecond, waitingOld, waitingNew}; strings.Join(got, " ") != strings.Join(want, " ") {
+		t.Fatalf("with a key = %v, want %v", got, want)
+	}
+	if code, b := f.call("GET", "/admin/imports?state=nonsense", f.adminT, "", nil); code != 400 {
+		t.Fatalf("an unknown state = %d %v", code, b)
+	}
+}
+
+func TestTheDiskCheckCountsEveryUnfinishedImport(t *testing.T) {
+	f := setup(t)
+	ctx := context.Background()
+	if _, err := f.pool.Exec(ctx, `DELETE FROM import_jobs WHERE status IN ('awaiting_files', 'processing')`); err != nil {
+		t.Fatal(err)
+	}
+	tag := testutil.Unique("Space")
+	f.forget(tag)
+	const margin = int64(1 << 30) // what the handler keeps free in these tests
+	const song = 4000             // each job: one song of this many bytes, 14000 on disk once done
+	data := map[string][]byte{"a.mp3": bytes.Repeat([]byte("a"), song)}
+	body := func(n string) map[string]any {
+		return manifest(n+" "+tag, data, map[string]any{"title": "T " + n, "audioFile": "a.mp3"})
+	}
+	post := func(n string) (int, map[string]any) {
+		return f.call("POST", "/admin/imports", f.adminT, testutil.Unique("space"), body(n))
+	}
+	details := func(b map[string]any) map[string]any { return obj(obj(b["error"])["details"]) }
+
+	// room for two whole songs: each alone fits many times over, the third does not fit beside the two waiting
+	f.free = margin + 2*14000 + 100
+	idem := testutil.Unique("space")
+	code, a := f.call("POST", "/admin/imports", f.adminT, idem, body("A"))
+	code2, b := post("B")
+	if code != 201 || code2 != 201 {
+		t.Fatalf("two that fit = %d %d %v %v", code, code2, a, b)
+	}
+	code, c := post("C")
+	if code != 507 || errCode(c) != "insufficient_storage" || details(c)["reservedBytes"] != float64(2*14000) || details(c)["needBytes"] != float64(14000) {
+		t.Fatalf("one too many = %d %v", code, c)
+	}
+	idA, idB := a["jobId"].(string), b["jobId"].(string)
+	// cancelling a waiting job gives its place back
+	if code, _ = f.call("DELETE", "/admin/imports/"+idB, f.adminT, "", nil); code != 204 {
+		t.Fatalf("cancel = %d", code)
+	}
+	code, b = post("B again")
+	if code != 201 {
+		t.Fatalf("after a cancel = %d %v", code, b)
+	}
+	idB = b["jobId"].(string)
+
+	// jobs that passed earlier, when there was more room (as under the old check), are checked again.
+	// Too little even to send the file: no new links, by either way of asking
+	f.free = margin + song - 1
+	for name, ask := range map[string]func() (int, map[string]any){
+		"links":          func() (int, map[string]any) { return f.call("POST", "/admin/imports/"+idA+"/links", f.adminT, "", nil) },
+		"same key again": func() (int, map[string]any) { return f.call("POST", "/admin/imports", f.adminT, idem, body("A")) },
+	} {
+		if code, got := ask(); code != 507 || errCode(got) != "insufficient_storage" {
+			t.Errorf("%s without room to send = %d %v", name, code, got)
+		}
+	}
+	// room to send: links again, whatever else is waiting
+	f.free = margin + song
+	if code, got := f.call("POST", "/admin/imports/"+idA+"/links", f.adminT, "", nil); code != 200 {
+		t.Fatalf("links with room = %d %v", code, got)
+	}
+	f.send(idA, a, data)
+	f.send(idB, b, data)
+
+	// room for one job's playback copies (10000), not two: the waiting one does not hold back the first start,
+	// the started one does hold back the second
+	f.free = margin + 15000
+	if code, got := f.call("POST", "/admin/imports/"+idA+"/start", f.adminT, "", nil); code != 202 {
+		t.Fatalf("first start = %d %v", code, got)
+	}
+	code, got := f.call("POST", "/admin/imports/"+idB+"/start", f.adminT, "", nil)
+	if code != 507 || details(got)["reservedBytes"] != float64(10000) || details(got)["needBytes"] != float64(10000) {
+		t.Fatalf("second start = %d %v", code, got)
+	}
+	if _, v := f.call("GET", "/admin/imports/"+idB, f.adminT, "", nil); v["status"] != "pending" {
+		t.Fatalf("a refused start leaves the job waiting: %v", v["status"])
+	}
+	// with nothing left to send, links still answer, so the caller can see the job is complete
+	f.free = margin
+	if code, got := f.call("POST", "/admin/imports/"+idB+"/links", f.adminT, "", nil); code != 200 {
+		t.Fatalf("links with everything sent = %d %v", code, got)
+	}
+	// when the first is done it no longer reserves anything
+	f.free = margin + 15000
+	if v := f.drive(idA, nil); v["status"] != "completed" {
+		t.Fatalf("first job = %v", v)
+	}
+	if code, got = f.call("POST", "/admin/imports/"+idB+"/start", f.adminT, "", nil); code != 202 {
+		t.Fatalf("second start after the first finished = %d %v", code, got)
+	}
+	f.drive(idB, nil)
+
+	// several creations at the same moment cannot share the same free space
+	f.free = margin + 14000 + 100
+	codes := make(chan int, 6)
+	var wg sync.WaitGroup
+	for i := range 6 {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			code, _ := post("Race " + strconv.Itoa(i))
+			codes <- code
+		}()
+	}
+	wg.Wait()
+	close(codes)
+	count := map[int]int{}
+	for code := range codes {
+		count[code]++
+	}
+	if count[201] != 1 || count[507] != 5 {
+		t.Fatalf("six at once with room for one = %v", count)
+	}
+}
+
+func TestPagingThroughFinishedImports(t *testing.T) {
+	f := setup(t)
+	ctx := context.Background()
+	insert := func(owner, status string, created, ended int) (id string) {
+		t.Helper()
+		if err := f.pool.QueryRow(ctx, `INSERT INTO import_jobs (created_by, idempotency_key, artist_name, release_type, publish, rights_basis, status, created_at, finished_at)
+			VALUES ($1::uuid, $2, 'A', 'single', 'draft', 'test jobs', $3, now() - make_interval(mins => $4),
+			        CASE WHEN $5::int >= 0 THEN now() - make_interval(mins => $5) END) RETURNING id`,
+			owner, testutil.Unique("done"), status, created, ended).Scan(&id); err != nil {
+			t.Fatal(err)
+		}
+		return id
+	}
+	// a key's list holds only its administrator's jobs, so with a key the counts are exact whatever else is in the table
+	_, k := f.call("POST", "/admin/api-keys", f.adminT, "", map[string]any{"name": "pager"})
+	key := k["key"].(string)
+
+	// 23 ended jobs, made in the opposite order to the one they ended in; two ended at the same moment
+	statuses := []string{"completed", "completed_with_errors", "failed", "cancelled"}
+	var want []string // latest ending first
+	for i := range 21 {
+		want = append(want, insert(f.admin, statuses[i%4], 500-i, 10+i))
+	}
+	tieA, tieB := insert(f.admin, "completed", 100, 200), ""
+	if err := f.pool.QueryRow(ctx, `INSERT INTO import_jobs (created_by, idempotency_key, artist_name, release_type, publish, rights_basis, status, finished_at)
+		SELECT created_by, $2, artist_name, release_type, publish, rights_basis, status, finished_at FROM import_jobs WHERE id = $1 RETURNING id`,
+		tieA, testutil.Unique("tie")).Scan(&tieB); err != nil {
+		t.Fatal(err)
+	}
+	if tieB > tieA {
+		tieA, tieB = tieB, tieA
+	}
+	want = append(want, tieA, tieB)
+	// newer jobs that are not finished must not hide them
+	for i := range 25 {
+		insert(f.admin, []string{"processing", "awaiting_files"}[i%2], 1, -1)
+	}
+	other := testutil.User(t, f.pool, "admin", true)
+	theirs := insert(other, "completed", 1, 0)
+
+	get := func(token, query string) (int, []string, float64, []any) {
+		code, b := f.call("GET", "/admin/imports?"+query, token, "", nil)
+		var ids []string
+		for _, raw := range list(b["imports"]) {
+			ids = append(ids, obj(raw)["jobId"].(string))
+		}
+		total, _ := b["total"].(float64)
+		return code, ids, total, list(b["imports"])
+	}
+	if _, plain, _, _ := get(key, ""); len(plain) != 20 {
+		t.Fatalf("plain = %d", len(plain))
+	} else if _, b := f.call("GET", "/admin/imports", key, "", nil); b["total"] != nil {
+		t.Fatal("the plain list has no total")
+	}
+	var paged []string
+	for offset := 0; offset < 30; offset += 10 {
+		code, ids, total, rows := get(key, "state=finished&limit=10&offset="+strconv.Itoa(offset))
+		if code != 200 || total != 23 {
+			t.Fatalf("page at %d = %d, total %v", offset, code, total)
+		}
+		for _, raw := range rows {
+			row := obj(raw)
+			if row["status"] == "pending" || row["status"] == "processing" || row["results"] != nil || row["finishedAt"] == nil {
+				t.Fatalf("row = %v", row)
+			}
+		}
+		paged = append(paged, ids...)
+	}
+	if strings.Join(paged, " ") != strings.Join(want, " ") {
+		t.Fatalf("paged =\n%v\nwant\n%v", paged, want)
+	}
+	if _, ids, _, _ := get(key, "state=finished"); len(ids) != 20 {
+		t.Fatalf("the default page = %d", len(ids))
+	}
+	if _, ids, total, rows := get(key, "state=finished&offset=500"); len(ids) != 0 || total != 23 || rows == nil {
+		t.Fatalf("past the end = %v %v", ids, total)
+	}
+	// a signed-in administrator sees everybody's, the latest first
+	if _, ids, total, _ := get(f.adminT, "state=finished&limit=100"); total < 24 || !slices.Contains(ids, theirs) {
+		t.Fatalf("administrator: total %v", total)
+	}
+	for _, bad := range []string{"limit=0", "limit=101", "limit=x", "offset=-1", "offset=y"} {
+		if code, _, _, _ := get(key, "state=finished&"+bad); code != 400 {
+			t.Errorf("%s = %d, want 400", bad, code)
+		}
 	}
 }

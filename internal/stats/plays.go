@@ -25,7 +25,7 @@ const (
 // Sources the app may report where a play started; anything else is stored as "other".
 var Sources = map[string]bool{
 	"search": true, "album": true, "playlist": true, "artist": true, "library": true,
-	"radio": true, "downloads": true, "home": true, "other": true,
+	"radio": true, "downloads": true, "home": true, "other": true, "autoplay": true,
 }
 
 // ErrTrackNotFound means the track does not exist or is not public.

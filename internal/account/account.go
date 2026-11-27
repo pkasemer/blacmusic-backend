@@ -34,9 +34,8 @@ type Blobs interface {
 
 // Releases is the part of the release store the cleanup uses.
 type Releases interface {
-	ListMine(ctx context.Context, userID string, limit, offset int) ([]*release.Release, error)
-	Delete(ctx context.Context, id, userID string) error
-	DeleteTrack(ctx context.Context, id, userID string) error
+	AdminDelete(ctx context.Context, id string, audit func(context.Context, pgx.Tx) error) error
+	AdminDeleteTrack(ctx context.Context, id string, audit func(context.Context, pgx.Tx) error) error
 }
 
 // Service deletes accounts.
@@ -55,7 +54,8 @@ func NewService(pool *pgxpool.Pool, releases Releases, blobs Blobs) *Service {
 }
 
 // Delete removes the account and what it owns: releases, tracks and their files
-// (storage is freed), unfinished uploads, pictures, the artist profile, playlists,
+// (storage is freed), unfinished uploads, pictures, the artist profile (one received
+// from the catalog goes back to it instead, see doomed.go), playlists,
 // library, podcast subscriptions, sign-in methods and sessions. An account that
 // has a password must confirm it; a provider-only account is confirmed by its
 // session. It is safe to call again after a failure.
@@ -92,41 +92,33 @@ func (s *Service) delete(ctx context.Context, userID, password string, admin boo
 		}
 	}
 
-	// releases (with their tracks, files and unfinished uploads)
-	for {
-		rs, err := s.releases.ListMine(ctx, userID, 100, 0)
-		if err != nil {
-			return err
-		}
-		if len(rs) == 0 {
-			break
-		}
-		for _, r := range rs {
-			if err := s.releases.Delete(ctx, r.ID, userID); err != nil {
-				if errors.Is(err, release.ErrProcessing) {
-					return ErrBusy
-				}
-				return err
-			}
-		}
+	// the music that goes with the account (see doomed.go). An artist received from the catalog stays.
+	var busy bool
+	if err := s.pool.QueryRow(ctx, `SELECT EXISTS (SELECT 1 FROM uploads u WHERE u.status = 'processing' AND `+DoomedUploads+`)`, userID).Scan(&busy); err != nil {
+		return err
 	}
-	// tracks that belong to no release, and uploads that belong to no release
-	rows, err := s.pool.Query(ctx, `SELECT t.id FROM tracks t JOIN artists a ON a.id = t.artist_id WHERE a.owner_user_id = $1`, userID)
+	if busy {
+		return ErrBusy
+	}
+	// both lists are read before anything goes: deleting changes what they would say
+	releases, err := s.ids(ctx, DoomedReleases, userID)
 	if err != nil {
 		return err
 	}
-	var tracks []string
-	for rows.Next() {
-		var id string
-		if err := rows.Scan(&id); err != nil {
-			rows.Close()
+	tracks, err := s.ids(ctx, DoomedTracks, userID)
+	if err != nil {
+		return err
+	}
+	for _, id := range releases { // with their tracks, files and unfinished uploads
+		if err := s.releases.AdminDelete(ctx, id, nil); err != nil && !errors.Is(err, release.ErrNotFound) {
+			if errors.Is(err, release.ErrProcessing) {
+				return ErrBusy
+			}
 			return err
 		}
-		tracks = append(tracks, id)
 	}
-	rows.Close()
-	for _, id := range tracks {
-		if err := s.releases.DeleteTrack(ctx, id, userID); err != nil && !errors.Is(err, release.ErrNotFound) {
+	for _, id := range tracks { // the ones left: in a release that stays, or in none
+		if err := s.releases.AdminDeleteTrack(ctx, id, nil); err != nil && !errors.Is(err, release.ErrNotFound) {
 			return err
 		}
 	}
@@ -143,6 +135,13 @@ func (s *Service) delete(ctx context.Context, userID, password string, admin boo
 		return err
 	}
 	defer tx.Rollback(ctx) //nolint:errcheck
+	// a received artist goes back to the catalog; a verified badge stays, a request of the person's does not
+	if _, err := tx.Exec(ctx, `UPDATE artists SET owner_user_id = NULL, assigned_at = NULL, assigned_by = NULL, updated_at = now(),
+		verification = CASE WHEN verification = 'pending' THEN 'unverified' ELSE verification END,
+		verification_message = '', verification_requested_at = NULL
+		WHERE owner_user_id = $1 AND assigned_at IS NOT NULL`, userID); err != nil {
+		return err
+	}
 	if _, err := tx.Exec(ctx, `DELETE FROM artists WHERE owner_user_id = $1`, userID); err != nil {
 		return err
 	}
@@ -157,9 +156,18 @@ func (s *Service) delete(ctx context.Context, userID, password string, admin boo
 	return tx.Commit(ctx)
 }
 
-// removeUploads deletes the user's remaining upload rows and their files, aborting open multipart uploads.
+func (s *Service) ids(ctx context.Context, sql, userID string) ([]string, error) {
+	rows, err := s.pool.Query(ctx, sql, userID)
+	if err != nil {
+		return nil, err
+	}
+	return pgx.CollectRows(rows, pgx.RowTo[string])
+}
+
+// removeUploads deletes the upload rows that go with the account and are left, and their files, aborting open
+// multipart uploads.
 func (s *Service) removeUploads(ctx context.Context, userID string) error {
-	rows, err := s.pool.Query(ctx, `DELETE FROM uploads WHERE user_id = $1 AND status <> 'processing' RETURNING original_key, multipart_id`, userID)
+	rows, err := s.pool.Query(ctx, `DELETE FROM uploads u WHERE u.status <> 'processing' AND `+DoomedUploads+` RETURNING u.original_key, u.multipart_id`, userID)
 	if err != nil {
 		return err
 	}
@@ -184,7 +192,7 @@ func (s *Service) removeUploads(ctx context.Context, userID string) error {
 		_ = s.blobs.Remove(ctx, o.key)
 	}
 	var busy bool
-	if err := s.pool.QueryRow(ctx, `SELECT EXISTS (SELECT 1 FROM uploads WHERE user_id = $1)`, userID).Scan(&busy); err != nil {
+	if err := s.pool.QueryRow(ctx, `SELECT EXISTS (SELECT 1 FROM uploads u WHERE `+DoomedUploads+`)`, userID).Scan(&busy); err != nil {
 		return err
 	}
 	if busy {

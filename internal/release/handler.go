@@ -10,9 +10,11 @@ import (
 
 	"github.com/go-chi/chi/v5"
 
+	"github.com/blacmusic/backend/internal/artist"
 	"github.com/blacmusic/backend/internal/auth"
 	"github.com/blacmusic/backend/internal/genre"
 	"github.com/blacmusic/backend/internal/httpx"
+	"github.com/blacmusic/backend/internal/review"
 )
 
 // Handler serves the release and track-management endpoints (authenticated).
@@ -30,6 +32,7 @@ func (h *Handler) Routes(r chi.Router) {
 	r.Delete("/releases/{id}", h.delete)
 	r.Post("/releases/{id}/publish", h.publish)
 	r.Post("/releases/{id}/unpublish", h.unpublish)
+	r.Post("/releases/{id}/review/withdraw", h.withdraw)
 	r.Get("/me/releases", h.mine)
 	r.Get("/browse/albums", h.browse)
 	r.Get("/search/albums", h.search)
@@ -159,7 +162,11 @@ func (h *Handler) browse(w http.ResponseWriter, r *http.Request) {
 	if n, err := strconv.Atoi(r.URL.Query().Get("offset")); err == nil && n > 0 {
 		offset = min(n, 10000)
 	}
-	list, err := h.store.Browse(r.Context(), r.URL.Query().Get("sort"), r.URL.Query().Get("type"), limit, offset)
+	sort := r.URL.Query().Get("sort")
+	if sort == "" {
+		sort = "new"
+	}
+	list, err := h.store.Browse(r.Context(), sort, r.URL.Query().Get("type"), limit, offset)
 	var ve *ValidationError
 	if errors.As(err, &ve) {
 		httpx.Error(w, http.StatusBadRequest, "bad_request", ve.Msg)
@@ -169,7 +176,7 @@ func (h *Handler) browse(w http.ResponseWriter, r *http.Request) {
 		fail(w, err)
 		return
 	}
-	httpx.JSON(w, http.StatusOK, map[string]any{"releases": list})
+	httpx.JSON(w, http.StatusOK, map[string]any{"releases": list, "sort": sort})
 }
 
 // search handles GET /v1/search/albums?q=&type=all|single|ep|album&limit=&offset= (public releases only).
@@ -218,12 +225,16 @@ func (h *Handler) related(w http.ResponseWriter, r *http.Request) {
 func (h *Handler) byArtist(w http.ResponseWriter, r *http.Request) {
 	uid, _ := auth.UserID(r.Context())
 	limit, offset := page(r)
-	list, err := h.store.ListByArtist(r.Context(), chi.URLParam(r, "id"), uid, limit, offset)
+	sort := r.URL.Query().Get("sort")
+	if sort == "" {
+		sort = "new"
+	}
+	list, err := h.store.ListByArtist(r.Context(), chi.URLParam(r, "id"), uid, sort, limit, offset)
 	if err != nil {
 		fail(w, err)
 		return
 	}
-	httpx.JSON(w, http.StatusOK, map[string]any{"releases": list})
+	httpx.JSON(w, http.StatusOK, map[string]any{"releases": list, "sort": sort})
 }
 
 func (h *Handler) updateTrack(w http.ResponseWriter, r *http.Request) {
@@ -271,9 +282,23 @@ func logRemoveFailure(key string, err error) {
 	slog.Error("could not remove object after delete", "key", key, "err", err)
 }
 
+// POST /v1/releases/{id}/review/withdraw: takes back what is waiting for the team.
+func (h *Handler) withdraw(w http.ResponseWriter, r *http.Request) {
+	uid, _ := auth.UserID(r.Context())
+	if err := h.store.Withdraw(r.Context(), chi.URLParam(r, "id"), uid); err != nil {
+		fail(w, err)
+		return
+	}
+	w.WriteHeader(http.StatusNoContent)
+}
+
 func fail(w http.ResponseWriter, err error) {
 	var ve *ValidationError
 	switch {
+	case errors.Is(err, review.ErrPending):
+		httpx.Error(w, http.StatusConflict, "review_pending", review.Message)
+	case errors.Is(err, ErrNotPending):
+		httpx.Error(w, http.StatusConflict, "not_pending", "nothing is waiting for review")
 	case errors.As(err, &ve):
 		httpx.Error(w, http.StatusUnprocessableEntity, "validation_error", ve.Msg)
 	case errors.Is(err, genre.ErrInvalid):
@@ -287,7 +312,7 @@ func fail(w http.ResponseWriter, err error) {
 	case errors.Is(err, ErrTakenDown):
 		httpx.Error(w, http.StatusConflict, "taken_down", "this release was taken down by the Blac Music team; contact support")
 	case errors.Is(err, ErrArtistBanned):
-		httpx.Error(w, http.StatusForbidden, "account_banned", "this artist profile has been suspended")
+		httpx.Error(w, http.StatusForbidden, artist.CodeSuspended, "this artist profile has been suspended")
 	case errors.Is(err, ErrProcessing):
 		httpx.Error(w, http.StatusConflict, "processing", "a file in this release is being processed right now; try again in a moment")
 	default:

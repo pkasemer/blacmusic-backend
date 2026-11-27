@@ -93,7 +93,7 @@ func TestDraftsArePrivateUntilPublished(t *testing.T) {
 	if _, err := e.store.Get(ctx, rel, stranger); !errors.Is(err, ErrNotFound) {
 		t.Fatalf("stranger reading a draft = %v, want ErrNotFound", err)
 	}
-	if list, _ := e.store.ListByArtist(ctx, artistID, stranger, 50, 0); len(list) != 0 {
+	if list, _ := e.store.ListByArtist(ctx, artistID, stranger, "", 50, 0); len(list) != 0 {
 		t.Fatalf("a draft must not appear on the artist page: %v", list)
 	}
 	mine, err := e.store.Get(ctx, rel, uid)
@@ -122,7 +122,7 @@ func TestDraftsArePrivateUntilPublished(t *testing.T) {
 	if withPic, _ := e.store.Get(ctx, rel, stranger); withPic.Artist == nil || withPic.Artist.ImageURL != "http://api.test/v1/media/"+avatar+"/medium.jpg" {
 		t.Fatalf("release.artist.imageUrl = %+v, want the owner's avatar", withPic.Artist)
 	}
-	if list, _ := e.store.ListByArtist(ctx, artistID, stranger, 50, 0); len(list) != 1 || list[0].ID != rel || list[0].TrackCount != 2 {
+	if list, _ := e.store.ListByArtist(ctx, artistID, stranger, "", 50, 0); len(list) != 1 || list[0].ID != rel || list[0].TrackCount != 2 {
 		t.Fatalf("artist page: %v", list)
 	}
 	var vis string

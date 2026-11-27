@@ -16,7 +16,16 @@ var migrationsFS embed.FS
 
 // Connect opens a pgx pool and verifies connectivity.
 func Connect(ctx context.Context, url string) (*pgxpool.Pool, error) {
-	pool, err := pgxpool.New(ctx, url)
+	cfg, err := pgxpool.ParseConfig(url)
+	if err != nil {
+		return nil, fmt.Errorf("open pool: %w", err)
+	}
+	// The app's queries are short ones. Postgres's just-in-time compiling only gets in their way: when it guesses
+	// that a query is expensive (the metadata status view) compiling it takes seconds and running it milliseconds.
+	if _, set := cfg.ConnConfig.RuntimeParams["jit"]; !set {
+		cfg.ConnConfig.RuntimeParams["jit"] = "off"
+	}
+	pool, err := pgxpool.NewWithConfig(ctx, cfg)
 	if err != nil {
 		return nil, fmt.Errorf("open pool: %w", err)
 	}

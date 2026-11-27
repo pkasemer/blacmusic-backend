@@ -20,7 +20,8 @@ const columns = `t.id, t.title, COALESCE(t.artist_id, ''), COALESCE(a.name, ''),
 	COALESCE(to_char(al.release_date, 'YYYY-MM-DD'), to_char(al.published_at AT TIME ZONE 'Africa/Kampala', 'YYYY-MM-DD'), ''),
 	COALESCE(a.verification = 'verified', false),
 	EXISTS (SELECT 1 FROM track_lyrics tl WHERE tl.track_id = t.id),
-	EXISTS (SELECT 1 FROM release_credits rc WHERE rc.track_id = t.id OR (rc.track_id IS NULL AND rc.release_id = t.album_id))`
+	EXISTS (SELECT 1 FROM release_credits rc WHERE rc.track_id = t.id OR (rc.track_id IS NULL AND rc.release_id = t.album_id)),
+	featured_artists(t.id, t.album_id, t.artist_id)`
 
 const from = `
 	FROM tracks t
@@ -45,10 +46,15 @@ func Scan(row pgx.Row, publicURL string, extraDest ...any) (source.Track, error)
 	var t source.Track
 	var avatarID *string
 	var legacyImage string
+	var featured []byte
 	dest := []any{&t.ID, &t.Title, &t.ArtistID, &t.ArtistName, &t.AlbumID, &t.AlbumTitle,
 		&t.DurationMs, &t.ArtworkURL, &t.LoudnessLufs, &t.TruePeakDb,
-		&avatarID, &legacyImage, &t.Genre, &t.Explicit, &t.ReleaseDate, &t.ArtistVerified, &t.HasLyrics, &t.HasCredits}
+		&avatarID, &legacyImage, &t.Genre, &t.Explicit, &t.ReleaseDate, &t.ArtistVerified, &t.HasLyrics, &t.HasCredits, &featured}
 	if err := row.Scan(append(dest, extraDest...)...); err != nil {
+		return t, err
+	}
+	var err error
+	if t.FeaturedArtists, err = Featured(featured, publicURL); err != nil {
 		return t, err
 	}
 	t.ArtistImageURL = image.PersonURL(publicURL, avatarID, legacyImage)

@@ -48,7 +48,7 @@ type kind struct {
 var (
 	tracks  = kind{"tracks", "library_tracks", "track_id", "tracks", "e.visibility = 'public'"}
 	albums  = kind{"albums", "library_albums", "album_id", "albums", "e.visibility = 'public'"}
-	artists = kind{"artists", "library_artists", "artist_id", "artists", "true"}
+	artists = kind{"artists", "library_artists", "artist_id", "artists", "e.banned_at IS NULL"}
 	// Only public playlists can be saved: a private one is not for others.
 	playlists = kind{"playlists", "library_playlists", "playlist_id", "playlists", "e.is_public"}
 )
@@ -199,13 +199,16 @@ type savedAlbum struct {
 	ArtistVerified bool      `json:"artistVerified"`
 	ArtworkURL     string    `json:"artworkUrl,omitempty"`
 	AddedAt        time.Time `json:"addedAt"`
+	// FeaturedArtists as on every release; absent when there are none.
+	FeaturedArtists []source.FeaturedArtist `json:"featuredArtists,omitempty"`
 }
 
 func (h *Handler) listAlbums(w http.ResponseWriter, r *http.Request) {
 	uid, _ := auth.UserID(r.Context())
 	limit, offset := page(r)
 	rows, err := h.pool.Query(r.Context(), `
-		SELECT al.id, al.title, COALESCE(a.id, ''), COALESCE(a.name, ''), COALESCE(a.verification = 'verified', false), COALESCE(al.artwork_url, ''), l.added_at
+		SELECT al.id, al.title, COALESCE(a.id, ''), COALESCE(a.name, ''), COALESCE(a.verification = 'verified', false), COALESCE(al.artwork_url, ''), l.added_at,
+		       `+trackview.ReleaseFeatured+`
 		FROM library_albums l
 		JOIN albums al      ON al.id = l.album_id
 		LEFT JOIN artists a ON a.id  = al.artist_id
@@ -220,7 +223,12 @@ func (h *Handler) listAlbums(w http.ResponseWriter, r *http.Request) {
 	out := []savedAlbum{}
 	for rows.Next() {
 		var s savedAlbum
-		if err := rows.Scan(&s.ID, &s.Title, &s.ArtistID, &s.ArtistName, &s.ArtistVerified, &s.ArtworkURL, &s.AddedAt); err != nil {
+		var featured []byte
+		if err := rows.Scan(&s.ID, &s.Title, &s.ArtistID, &s.ArtistName, &s.ArtistVerified, &s.ArtworkURL, &s.AddedAt, &featured); err != nil {
+			serverError(w, err)
+			return
+		}
+		if s.FeaturedArtists, err = trackview.Featured(featured, h.PublicURL); err != nil {
 			serverError(w, err)
 			return
 		}

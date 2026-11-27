@@ -12,7 +12,7 @@ import (
 )
 
 // Updated is the date shown on both pages. Change it whenever the wording changes.
-const Updated = "24 November 2026"
+const Updated = "27 November 2026"
 
 //go:embed privacy.html
 var privacyHTML string

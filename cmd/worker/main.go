@@ -14,11 +14,13 @@ import (
 
 	"github.com/blacmusic/backend/internal/config"
 	"github.com/blacmusic/backend/internal/db"
+	"github.com/blacmusic/backend/internal/genre"
 	"github.com/blacmusic/backend/internal/importer"
 	"github.com/blacmusic/backend/internal/mailer"
 	"github.com/blacmusic/backend/internal/notify"
 	"github.com/blacmusic/backend/internal/podcast"
 	"github.com/blacmusic/backend/internal/push"
+	"github.com/blacmusic/backend/internal/recommend"
 	"github.com/blacmusic/backend/internal/release"
 	"github.com/blacmusic/backend/internal/storage"
 	"github.com/blacmusic/backend/internal/sysmetrics"
@@ -53,6 +55,7 @@ func run() error {
 	if err := db.Migrate(ctx, pool); err != nil { // safe to race the API: migrations take an advisory lock
 		return err
 	}
+	go genre.Watch(ctx, pool, 30*time.Second) // the team manages the genres
 
 	store, err := storage.New(cfg)
 	if err != nil {
@@ -79,6 +82,8 @@ func run() error {
 	slog.Info("worker started", "concurrency", cfg.WorkerConcurrency)
 	var wg sync.WaitGroup
 	releases := release.NewStore(pool, store, cfg.PublicAPIURL)
+	// imports an artist runs are published for review too; the team's bulk imports use their own store below
+	releases.Review, uploads.Review = cfg.ReleaseReview, cfg.ReleaseReview
 	releases.OnLive = notify.OnReleaseLive // the notification is queued in the transaction that makes the release public
 	// Pending uploads are abandoned once their presigned URL (plus a margin) has expired.
 	maint := worker.NewMaintenance(pool, uploads, releases, store, cfg.UploadURLTTL+30*time.Minute, cfg.FFmpegPath)
@@ -106,7 +111,8 @@ func run() error {
 	}
 	// bulk imports get a release store without publish hooks: they send no mail
 	imports := importer.NewRunner(pool, store, release.NewStore(pool, store, cfg.PublicAPIURL), uploads)
-	wg.Add(9)
+	wg.Add(10)
+	go func() { defer wg.Done(); recommend.Run(ctx, pool) }()                    // song statistics the recommendation engine ranks with
 	go func() { defer wg.Done(); sysmetrics.NewSampler(pool, store).Run(ctx) }() // readings for the admin site's server page
 	go func() { defer wg.Done(); imports.Run(ctx) }()
 	go func() { // cached YouTube data is refreshed or deleted within 30 days, as the privacy policy promises

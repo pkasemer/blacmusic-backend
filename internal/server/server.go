@@ -28,9 +28,11 @@ import (
 	"github.com/blacmusic/backend/internal/importopt"
 	"github.com/blacmusic/backend/internal/legal"
 	"github.com/blacmusic/backend/internal/library"
+	"github.com/blacmusic/backend/internal/listening"
 	"github.com/blacmusic/backend/internal/lyrics"
 	"github.com/blacmusic/backend/internal/mailer"
 	"github.com/blacmusic/backend/internal/notify"
+	"github.com/blacmusic/backend/internal/onboarding"
 	"github.com/blacmusic/backend/internal/playback"
 	"github.com/blacmusic/backend/internal/playlist"
 	"github.com/blacmusic/backend/internal/podcast"
@@ -109,8 +111,10 @@ func Handler(d Deps) http.Handler {
 	})
 	artistStore := artist.NewStore(d.Pool, d.Cfg.FreeStorageBytes, d.Cfg.PublicAPIURL)
 	artistH := artist.NewHandler(artistStore)
+	artistH.ReviewRequired, uploadStore.Review, artistStore.Review = d.Cfg.ReleaseReview, d.Cfg.ReleaseReview, d.Cfg.ReleaseReview
 	releaseStore := release.NewStore(d.Pool, d.Store, d.Cfg.PublicAPIURL)
 	releaseStore.OnPublish = notify.OnReleasePublished // the confirmation email is queued with the publish
+	releaseStore.Review = d.Cfg.ReleaseReview
 	releaseH := release.NewHandler(releaseStore)
 	uploadH.Tracks = releaseStore
 	imageH := image.NewHandler(d.Pool, d.Store, d.Cfg.PublicAPIURL)
@@ -119,6 +123,7 @@ func Handler(d Deps) http.Handler {
 	adminH := admin.NewHandler(d.Pool, artistStore, playlistStore)
 	adminH.Showcase = showcaseStore
 	profileH := profile.NewHandler(d.Pool, authSvc)
+	profileH.Review = d.Cfg.ReleaseReview
 
 	ytStore := youtube.NewStore(d.Pool)
 	ytProvider, ytVault := youtubeProvider(d.Cfg)
@@ -126,8 +131,12 @@ func Handler(d Deps) http.Handler {
 	transfers := transfer.NewManager(d.Pool, ytStore, releaseStore, uploadStore)
 	transfers.FetchEnabled = d.Cfg.YoutubeAudioFetch
 	transfers.Blobs = d.Store
-	lyricsH := lyrics.NewHandler(lyrics.NewStore(d.Pool))
-	creditsH := credits.NewHandler(credits.NewStore(d.Pool))
+	lyricsStore, creditsStore := lyrics.NewStore(d.Pool), credits.NewStore(d.Pool)
+	lyricsStore.Review, creditsStore.Review = d.Cfg.ReleaseReview, d.Cfg.ReleaseReview
+	lyricsH := lyrics.NewHandler(lyricsStore)
+	creditsH := credits.NewHandler(creditsStore)
+	adminH.Media = d.Store
+	adminH.Playback = playbackH.ResolveAny
 	statsH := stats.NewHandler(stats.NewStore(d.Pool))
 	importStore := importopt.NewStore(d.Pool)
 	transfers.Options = importStore
@@ -146,6 +155,7 @@ func Handler(d Deps) http.Handler {
 	adminH.Uploads = uploadH
 	uploadH.OnAdminComplete = adminH.OnUploadComplete
 	adminH.Bans, adminH.Accounts, adminH.Releases = bans, accounts, releaseStore
+	adminH.Blobs, adminH.Transfers = d.Store, transfers
 	// bulk catalogue import: its own routes also take a limited import key; the keys are managed under /v1/admin
 	bulkH := importer.NewHandler(d.Pool, d.Store, tokens, importer.Options{
 		MaxAudioBytes: d.Cfg.UploadMaxBytes, PartSize: d.Cfg.UploadPartBytes, URLTTL: d.Cfg.UploadURLTTL,
@@ -173,6 +183,15 @@ func Handler(d Deps) http.Handler {
 		// The signed-out screens load the curated showcase before anyone has an account.
 		v1.With(ratelimit.Middleware(d.Redis, "showcase", 60, time.Minute)).Get("/showcase", showcase.NewHandler(showcaseStore).List)
 
+		// The app's first-run questions are asked before there is an account. Many phones share one address, hence the
+		// generous limit.
+		onboardingH := onboarding.NewHandler(d.Pool, d.Cfg.PublicAPIURL)
+		v1.Group(func(open chi.Router) {
+			open.Use(ratelimit.Middleware(d.Redis, "onboarding", 120, time.Minute))
+			open.Get("/onboarding/config", onboardingH.Config)
+			open.Get("/onboarding/artists", onboardingH.Artists)
+		})
+
 		// Google sends the user's browser here after consent, so it carries no bearer token.
 		v1.Get("/integrations/youtube/callback", ytH.Callback)
 
@@ -191,7 +210,8 @@ func Handler(d Deps) http.Handler {
 
 		v1.Group(func(priv chi.Router) {
 			priv.Use(auth.RequireWith(tokens, bans))
-			priv.Use(searchLog.Middleware) // records what is searched (first page only, no user, no address)
+			priv.Use(searchLog.Middleware)          // records what is searched (first page only, no user, no address)
+			priv.Use(artist.SuspendedGuard(d.Pool)) // a suspended artist can still listen, but not change anything in the studio
 			priv.Get("/me", authH.Me)
 			priv.Patch("/me", profileH.Update)
 			priv.Delete("/me", accountH.Delete)
@@ -203,6 +223,13 @@ func Handler(d Deps) http.Handler {
 			priv.Post("/auth/email/verify", authH.VerifyEmail)
 			priv.Get("/search", catalogH.Search)
 			priv.Get("/browse/tracks", catalogH.Browse)
+			priv.Post("/mixes", catalogH.Mix)
+			listeningH := listening.NewHandler(d.Pool)
+			priv.Post("/me/listening-events", listeningH.Events)
+			priv.Get("/me/your-sound", listeningH.YourSound)
+			priv.Get("/onboarding/preferences", onboardingH.Get)
+			priv.Post("/onboarding/preferences", onboardingH.Save)
+			priv.Post("/onboarding/complete", onboardingH.Complete)
 			priv.Get("/browse/artists", catalogH.BrowseArtists)
 			priv.Get("/browse/playlists", playlistH.Browse)
 			priv.Get("/browse/playlist-groups", playlistH.BrowseGroups)

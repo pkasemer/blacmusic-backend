@@ -10,6 +10,7 @@ import (
 
 	"github.com/blacmusic/backend/internal/auth"
 	"github.com/blacmusic/backend/internal/httpx"
+	"github.com/blacmusic/backend/internal/review"
 )
 
 // Handler serves the credits endpoints (authenticated).
@@ -35,12 +36,20 @@ func (h *Handler) Routes(r chi.Router) {
 
 func (h *Handler) release(w http.ResponseWriter, r *http.Request) {
 	uid, _ := auth.UserID(r.Context())
-	list, err := h.store.ForRelease(r.Context(), chi.URLParam(r, "id"), uid)
+	list, info, err := h.store.OwnerList(r.Context(), chi.URLParam(r, "id"), uid)
 	if err != nil {
 		fail(w, err)
 		return
 	}
-	httpx.JSON(w, http.StatusOK, map[string]any{"credits": list})
+	reply(w, list, info)
+}
+
+func reply(w http.ResponseWriter, list []Credit, info *review.Info) {
+	out := map[string]any{"credits": list}
+	if info != nil {
+		out["review"] = info
+	}
+	httpx.JSON(w, http.StatusOK, out)
 }
 
 func (h *Handler) track(w http.ResponseWriter, r *http.Request) {
@@ -62,12 +71,16 @@ func (h *Handler) put(w http.ResponseWriter, r *http.Request) {
 		httpx.Error(w, http.StatusBadRequest, "bad_request", "send {\"credits\": [...]} (an empty list removes every credit)")
 		return
 	}
-	list, err := h.store.Replace(r.Context(), chi.URLParam(r, "id"), uid, req.Credits)
+	if _, err := h.store.Replace(r.Context(), chi.URLParam(r, "id"), uid, req.Credits); err != nil {
+		fail(w, err)
+		return
+	}
+	list, info, err := h.store.OwnerList(r.Context(), chi.URLParam(r, "id"), uid)
 	if err != nil {
 		fail(w, err)
 		return
 	}
-	httpx.JSON(w, http.StatusOK, map[string]any{"credits": list})
+	reply(w, list, info)
 }
 
 func (h *Handler) suggest(w http.ResponseWriter, r *http.Request) {
@@ -87,6 +100,8 @@ func (h *Handler) suggest(w http.ResponseWriter, r *http.Request) {
 func fail(w http.ResponseWriter, err error) {
 	var ve *ValidationError
 	switch {
+	case errors.Is(err, review.ErrPending):
+		httpx.Error(w, http.StatusConflict, "review_pending", review.Message)
 	case errors.Is(err, ErrNotFound):
 		httpx.Error(w, http.StatusNotFound, "not_found", "not found")
 	case errors.Is(err, ErrNoArtist):

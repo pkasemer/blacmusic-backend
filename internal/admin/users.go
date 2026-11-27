@@ -19,10 +19,18 @@ import (
 func (h *Handler) userRoutes(r chi.Router) {
 	r.Get("/users", h.listUsers)
 	r.Get("/users/{id}", h.getUser)
+	r.Get("/users/{id}/preference-graph", h.preferenceGraph)
 	r.Post("/users/{id}/ban", h.banUser)
 	r.Post("/users/{id}/unban", h.unbanUser)
 	r.Get("/users/{id}/deletion-preview", h.userDeletionPreview)
 	r.Delete("/users/{id}", h.deleteUser)
+	r.Put("/users/{id}/signals", h.setUserSignals)
+	r.Get("/users/{id}/recommendations", h.explainRecommendations)
+	r.Get("/recommendations/outcomes", h.recommendationOutcomes)
+	r.Get("/recommendations/readiness", h.recommendationReadiness)
+	r.Get("/recommendations/blocks", h.listBlocks)
+	r.Post("/recommendations/blocks", h.addBlock)
+	r.Delete("/recommendations/blocks/{id}", h.removeBlock)
 }
 
 type userRow struct {
@@ -34,6 +42,8 @@ type userRow struct {
 	Banned        bool      `json:"banned"`
 	HasArtist     bool      `json:"hasArtist"`
 	CreatedAt     time.Time `json:"createdAt"`
+	// SignalsExcluded: what this account does is left out of what other listeners are offered
+	SignalsExcluded bool `json:"signalsExcluded"`
 }
 
 // GET /v1/admin/users?q=&role=&status=active|banned|unverified&sort=createdAt|email|displayName&order=asc|desc&limit=&offset=
@@ -80,7 +90,8 @@ func (h *Handler) listUsers(w http.ResponseWriter, r *http.Request) {
 	}
 	rows, err := h.pool.Query(r.Context(), `
 		SELECT u.id::text, u.email, u.display_name, u.role, u.email_verified_at IS NOT NULL, u.banned_at IS NOT NULL,
-		       EXISTS (SELECT 1 FROM artists a WHERE a.owner_user_id = u.id), u.created_at
+		       EXISTS (SELECT 1 FROM artists a WHERE a.owner_user_id = u.id), u.created_at,
+		       u.role = 'admin' OR u.signals_excluded_at IS NOT NULL
 		FROM users u`+where+` ORDER BY `+col+` `+dir+`, u.id LIMIT $5 OFFSET $6`, append(args, limit, offset)...)
 	if err != nil {
 		reply(w, err)
@@ -90,7 +101,7 @@ func (h *Handler) listUsers(w http.ResponseWriter, r *http.Request) {
 	out := []userRow{}
 	for rows.Next() {
 		var u userRow
-		if err := rows.Scan(&u.ID, &u.Email, &u.DisplayName, &u.Role, &u.EmailVerified, &u.Banned, &u.HasArtist, &u.CreatedAt); err != nil {
+		if err := rows.Scan(&u.ID, &u.Email, &u.DisplayName, &u.Role, &u.EmailVerified, &u.Banned, &u.HasArtist, &u.CreatedAt, &u.SignalsExcluded); err != nil {
 			reply(w, err)
 			return
 		}
@@ -134,10 +145,11 @@ func (h *Handler) getUser(w http.ResponseWriter, r *http.Request) {
 		       u.ban_reason, COALESCE(u.banned_by::text, ''), COALESCE((SELECT email FROM users b WHERE b.id = u.banned_by), ''),
 		       u.password_hash, COALESCE(a.id, ''), COALESCE(a.name, ''),
 		       EXISTS (SELECT 1 FROM push_tokens p WHERE p.user_id = u.id),
-		       (SELECT max(created_at) FROM refresh_tokens t WHERE t.user_id = u.id)
+		       (SELECT max(created_at) FROM refresh_tokens t WHERE t.user_id = u.id),
+		       u.role = 'admin' OR u.signals_excluded_at IS NOT NULL
 		FROM users u LEFT JOIN artists a ON a.owner_user_id = u.id WHERE u.id::text = $1`, id).
 		Scan(&u.ID, &u.Email, &u.DisplayName, &u.Role, &u.EmailVerified, &bannedAt, &u.CreatedAt, &avatarID,
-			&banReason, &bannedBy, &bannedByEmail, &hash, &artistID, &artistName, &u.PushEnabled, &u.LastSeenAt)
+			&banReason, &bannedBy, &bannedByEmail, &hash, &artistID, &artistName, &u.PushEnabled, &u.LastSeenAt, &u.SignalsExcluded)
 	if err != nil {
 		reply(w, err)
 		return
@@ -368,23 +380,26 @@ func (h *Handler) userPreview(ctx context.Context, id string) (map[string]any, s
 	var artistID, artistName string
 	var releases, tracks, playlists, uploads, library, sessions int
 	var storage int64
+	var returns bool
 	err := h.pool.QueryRow(ctx, `
 		SELECT COALESCE((SELECT id FROM artists WHERE owner_user_id::text = $1), ''), COALESCE((SELECT name FROM artists WHERE owner_user_id::text = $1), ''),
-		       (SELECT count(*) FROM albums al JOIN artists a ON a.id = al.artist_id WHERE a.owner_user_id::text = $1),
-		       (SELECT count(*) FROM tracks t JOIN artists a ON a.id = t.artist_id WHERE a.owner_user_id::text = $1),
+		       COALESCE((SELECT assigned_at IS NOT NULL FROM artists WHERE owner_user_id::text = $1), false),
+		       (SELECT count(*) FROM (`+account.DoomedReleases+`) r),
+		       (SELECT count(*) FROM (`+account.DoomedTracks+`) t),
 		       (SELECT count(*) FROM playlists WHERE owner_id::text = $1),
-		       (SELECT count(*) FROM uploads WHERE user_id::text = $1),
-		       (SELECT COALESCE(sum(size_bytes), 0) FROM uploads WHERE user_id::text = $1 AND status <> 'failed'),
+		       (SELECT count(*) FROM uploads u WHERE `+account.DoomedUploads+`),
+		       (SELECT COALESCE(sum(u.size_bytes), 0) FROM uploads u WHERE u.status <> 'failed' AND `+account.DoomedUploads+`),
 		       (SELECT count(*) FROM library_tracks WHERE user_id::text = $1) + (SELECT count(*) FROM library_albums WHERE user_id::text = $1)
 		       + (SELECT count(*) FROM library_artists WHERE user_id::text = $1) + (SELECT count(*) FROM library_playlists WHERE user_id::text = $1),
 		       (SELECT count(*) FROM refresh_tokens WHERE user_id::text = $1 AND revoked_at IS NULL AND expires_at > now())`, id).
-		Scan(&artistID, &artistName, &releases, &tracks, &playlists, &uploads, &storage, &library, &sessions)
+		Scan(&artistID, &artistName, &returns, &releases, &tracks, &playlists, &uploads, &storage, &library, &sessions)
 	if err != nil {
 		return nil, "", "", err
 	}
 	var artist any
 	if artistID != "" {
-		artist = map[string]any{"id": artistID, "name": artistName}
+		// returnsToCatalog: the artist stays (received from the catalog); the counts are only what is really deleted
+		artist = map[string]any{"id": artistID, "name": artistName, "returnsToCatalog": returns}
 	}
 	return map[string]any{"artist": artist, "releases": releases, "tracks": tracks, "playlists": playlists, "uploads": uploads,
 		"storageBytes": storage, "libraryItems": library, "sessions": sessions}, email, role, nil

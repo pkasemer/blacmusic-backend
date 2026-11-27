@@ -15,6 +15,7 @@ import (
 	"github.com/blacmusic/backend/internal/httpx"
 	"github.com/blacmusic/backend/internal/storage"
 	"github.com/blacmusic/backend/internal/sysmetrics"
+	"github.com/blacmusic/backend/internal/upload"
 )
 
 // How the server is doing: its load, memory and disk, what the app stores, and the work that is waiting.
@@ -71,6 +72,7 @@ type workView struct {
 		Pending             int `json:"pending"` // started, file not sent yet
 		Queued              int `json:"queued"`
 		Processing          int `json:"processing"`
+		Stuck               int `json:"stuck"` // of those processing, the ones no worker is on any more
 		FailedLast24        int `json:"failedLast24h"`
 		OldestQueuedSeconds int `json:"oldestQueuedSeconds"`
 	} `json:"uploads"`
@@ -125,6 +127,13 @@ func alerts(host *sysmetrics.Host, w workView, lastSample *time.Time, now time.T
 		if lastSample == nil || now.Sub(*lastSample) > 3*sysmetrics.SampleEvery {
 			add("critical", "worker_silent", "The background worker has not reported for 15 minutes or more: uploads may not be processed.")
 		}
+	}
+	if n := w.Uploads.Stuck; n > 0 {
+		msg := "A song is stuck: no worker is working on it. Retry it from the processing list."
+		if n > 1 {
+			msg = fmt.Sprintf("%d songs are stuck: no worker is working on them. Retry them from the processing list.", n)
+		}
+		add("warning", "upload_stuck", msg)
 	}
 	if w.Uploads.OldestQueuedSeconds > 30*60 {
 		add("warning", "queue_slow", fmt.Sprintf("An upload has been waiting %d minutes to be processed.", w.Uploads.OldestQueuedSeconds/60))
@@ -227,8 +236,9 @@ func (h *Handler) systemData(ctx context.Context, v *systemView) error {
 	if err := h.pool.QueryRow(ctx, `
 		SELECT count(*) FILTER (WHERE status = 'pending'), count(*) FILTER (WHERE status = 'queued'), count(*) FILTER (WHERE status = 'processing'),
 		       count(*) FILTER (WHERE status = 'failed' AND updated_at > now() - interval '24 hours'),
-		       COALESCE(EXTRACT(EPOCH FROM now() - min(updated_at) FILTER (WHERE status = 'queued')), 0)::int
-		FROM uploads`).Scan(&u.Pending, &u.Queued, &u.Processing, &u.FailedLast24, &u.OldestQueuedSeconds); err != nil {
+		       COALESCE(EXTRACT(EPOCH FROM now() - min(updated_at) FILTER (WHERE status = 'queued')), 0)::int,
+		       count(*) FILTER (WHERE status = 'processing' AND (locked_at IS NULL OR locked_at < now() - make_interval(secs => $1)))
+		FROM uploads`, upload.StuckAfter.Seconds()).Scan(&u.Pending, &u.Queued, &u.Processing, &u.FailedLast24, &u.OldestQueuedSeconds, &u.Stuck); err != nil {
 		return err
 	}
 	if err := h.pool.QueryRow(ctx, `SELECT count(*) FILTER (WHERE status = 'awaiting_files'), count(*) FILTER (WHERE status = 'processing') FROM import_jobs`).

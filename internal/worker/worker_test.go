@@ -71,8 +71,20 @@ func (e *env) submit(releaseID string, data []byte) *upload.Upload {
 	if _, err := e.store.Queue(ctx, u.ID, u.SizeBytes); err != nil {
 		e.t.Fatal(err)
 	}
-	// Claim the oldest queued job; on a shared DB it may belong to someone
-	// else, so put those back and keep looking.
+	return e.claim(u.ID)
+}
+
+// claim takes the queued upload id. The oldest queued job is claimed first; on a
+// shared DB it may belong to someone else, so those are put back afterwards.
+func (e *env) claim(id string) *upload.Upload {
+	e.t.Helper()
+	ctx := context.Background()
+	var others []string
+	defer func() {
+		for _, o := range others {
+			_ = e.store.Requeue(ctx, o)
+		}
+	}()
 	for i := 0; i < 50; i++ {
 		j, err := e.store.Claim(ctx, time.Hour, 3)
 		if err != nil {
@@ -81,10 +93,10 @@ func (e *env) submit(releaseID string, data []byte) *upload.Upload {
 		if j == nil {
 			break
 		}
-		if j.ID == u.ID {
+		if j.ID == id {
 			return j
 		}
-		_ = e.store.Requeue(ctx, j.ID)
+		others = append(others, j.ID)
 	}
 	e.t.Fatal("could not claim the test upload")
 	return nil
@@ -354,6 +366,7 @@ func TestTransientErrorRequeuesThenFailsAfterMaxAttempts(t *testing.T) {
 	if st, _ := e.store.Get(ctx, job.ID); st.Status != upload.StatusQueued {
 		t.Fatalf("after 1st failure status = %s, want queued (retry)", st.Status)
 	}
+	job = e.claim(job.ID)
 	job.Attempts = e.w.cfg.MaxAttempts // pretend this was the last allowed try
 	e.w.handle(ctx, job)
 	if st, _ := e.store.Get(ctx, job.ID); st.Status != upload.StatusFailed {

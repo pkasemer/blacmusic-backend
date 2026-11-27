@@ -206,6 +206,98 @@ func TestValidationOwnershipAndCap(t *testing.T) {
 	}
 }
 
+func TestAdministratorsHaveNoImageLimit(t *testing.T) {
+	e := setup(t)
+	ctx := context.Background()
+	admin := testutil.User(t, e.pool, "admin", true)
+	tok := testutil.Token(t, admin)
+	// far more than the limit already: some finished (in use or not), some still waiting for their file
+	if _, err := e.pool.Exec(ctx, `INSERT INTO images (owner_id, purpose, status, original_key, size_bytes)
+		SELECT $1, CASE WHEN n % 2 = 0 THEN 'cover' ELSE 'avatar' END, CASE WHEN n % 3 = 0 THEN 'pending' ELSE 'ready' END, 'k', 1
+		FROM generate_series(1, $2::int) n`, admin, MaxImagesPerUser*3); err != nil {
+		t.Fatal(err)
+	}
+	for _, purpose := range []string{"avatar", "cover"} {
+		if code, b, _, _ := e.do("POST", "/images", tok, map[string]any{"purpose": purpose, "sizeBytes": 10}); code != 201 {
+			t.Fatalf("administrator, %s = %d %v", purpose, code, b)
+		}
+	}
+	// the limit comes back with the role: it is read each time
+	if _, err := e.pool.Exec(ctx, `UPDATE users SET role = 'user' WHERE id = $1`, admin); err != nil {
+		t.Fatal(err)
+	}
+	if code, b, _, _ := e.do("POST", "/images", tok, map[string]any{"purpose": "cover", "sizeBytes": 10}); code != 409 || errCode(b) != "limit_reached" {
+		t.Fatalf("no longer an administrator = %d %v, want 409 limit_reached", code, b)
+	}
+}
+
+func TestPicturesInUseDoNotUseUpTheLimit(t *testing.T) {
+	e := setup(t)
+	ctx := context.Background()
+	uid := testutil.User(t, e.pool, "user", true)
+	tok := testutil.Token(t, uid)
+	artistID := testutil.Artist(t, e.pool, uid, testutil.Unique("Prolific"), testutil.GiB)
+	exec := func(sql string, args ...any) {
+		t.Helper()
+		if _, err := e.pool.Exec(ctx, sql, args...); err != nil {
+			t.Fatal(err)
+		}
+	}
+	picture := func(status string) (id string) {
+		t.Helper()
+		if err := e.pool.QueryRow(ctx, `INSERT INTO images (owner_id, purpose, status, original_key, size_bytes) VALUES ($1, 'cover', $2, 'k', 1) RETURNING id`,
+			uid, status).Scan(&id); err != nil {
+			t.Fatal(err)
+		}
+		return id
+	}
+	add := func() (int, map[string]any) {
+		code, b, _, _ := e.do("POST", "/images", tok, map[string]any{"purpose": "cover", "sizeBytes": 10})
+		return code, b
+	}
+
+	// far more pictures than the limit, every one of them shown somewhere
+	var covers []string
+	for range MaxImagesPerUser + 10 {
+		rel := testutil.Release(t, e.pool, artistID, "R", "single", "draft")
+		cover := picture("ready")
+		exec(`UPDATE albums SET cover_image_id = $2 WHERE id = $1`, rel, cover)
+		covers = append(covers, cover)
+	}
+	exec(`UPDATE users SET avatar_image_id = $2 WHERE id = $1`, uid, picture("ready"))
+	exec(`UPDATE artists SET avatar_image_id = $2 WHERE id = $1`, artistID, picture("ready"))
+	exec(`INSERT INTO playlists (owner_id, name, cover_image_id) VALUES ($1, 'Mine', $2)`, uid, picture("ready"))
+	if code, b := add(); code != 201 {
+		t.Fatalf("with %d pictures in use = %d %v, want 201", len(covers)+3, code, b)
+	}
+
+	// unused ones count, whether finished or still waiting for their file (one is waiting already); rejected ones do not
+	for range MaxImagesPerUser - 2 {
+		picture("ready")
+	}
+	picture("failed")
+	if code, b := add(); code != 201 { // the 50th unused picture
+		t.Fatalf("the last free place = %d %v", code, b)
+	}
+	if code, b := add(); code != 409 || errCode(b) != "limit_reached" {
+		t.Fatalf("with the limit of unused pictures reached = %d %v", code, b)
+	}
+	// a cover that is taken off its release counts again; putting unused ones to use frees places
+	var spare string
+	if err := e.pool.QueryRow(ctx, `SELECT i.id FROM images i WHERE i.owner_id = $1 AND i.status = 'ready' AND `+notInUse+` LIMIT 1`, uid).Scan(&spare); err != nil {
+		t.Fatal(err)
+	}
+	rel := testutil.Release(t, e.pool, artistID, "Late", "single", "draft")
+	exec(`UPDATE albums SET cover_image_id = $2 WHERE id = $1`, rel, spare)
+	if code, b := add(); code != 201 {
+		t.Fatalf("after using one = %d %v", code, b)
+	}
+	exec(`UPDATE albums SET cover_image_id = NULL WHERE cover_image_id = $1`, covers[0])
+	if code, _ := add(); code != 409 {
+		t.Fatalf("after taking a cover off = %d, want 409", code)
+	}
+}
+
 func TestExpirePendingRemovesAbandonedUploads(t *testing.T) {
 	e := setup(t)
 	tok := testutil.Token(t, testutil.User(t, e.pool, "user", true))

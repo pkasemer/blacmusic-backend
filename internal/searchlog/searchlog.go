@@ -69,7 +69,7 @@ func (l *Logger) run(ctx context.Context) {
 func (l *Logger) write(ctx context.Context, e event) {
 	_, err := l.pool.Exec(ctx, `
 		INSERT INTO search_queries (kind, query, results)
-		SELECT $1, $2, $3 WHERE NOT EXISTS (SELECT 1 FROM users WHERE id::text = $4 AND role = 'admin')`,
+		SELECT $1, $2, $3 WHERE NOT EXISTS (SELECT 1 FROM signal_excluded_users WHERE id::text = $4)`,
 		e.kind, e.query, e.results, e.userID)
 	if err != nil && ctx.Err() == nil {
 		slog.Warn("search log", "err", err)

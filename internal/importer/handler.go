@@ -64,7 +64,9 @@ func NewHandler(pool *pgxpool.Pool, blobs Blobs, tokens *auth.TokenService, opt 
 // Routes registers the import routes (mounted at /v1/admin/imports, behind Authenticate):
 //
 //	POST   /                create a job from a manifest (Idempotency-Key header) -> upload links
-//	GET    /                the latest jobs
+//	GET    /                the latest 20 jobs
+//	GET    /?state=unfinished  every job that is processing or waiting for files, in working order
+//	GET    /?state=finished&limit=&offset=  the ended jobs, a page at a time, with their total
 //	GET    /{id}            status and per-track results
 //	POST   /{id}/links      fresh upload links for the files that have not arrived
 //	POST   /{id}/start      every file is there: do the import
@@ -307,6 +309,14 @@ func (h *Handler) create(w http.ResponseWriter, r *http.Request) {
 	var existing string
 	err := h.pool.QueryRow(ctx, `SELECT id FROM import_jobs WHERE created_by::text = $1 AND idempotency_key = $2`, p.UserID, idem).Scan(&existing)
 	if err == nil {
+		var waiting bool
+		if err := h.pool.QueryRow(ctx, `SELECT status = 'awaiting_files' FROM import_jobs WHERE id = $1`, existing).Scan(&waiting); err != nil {
+			serverError(w, err)
+			return
+		}
+		if waiting && !h.roomToSend(w, r, existing) {
+			return
+		}
 		h.respond(w, r, existing, http.StatusOK, true)
 		return
 	}
@@ -401,23 +411,27 @@ func (h *Handler) create(w http.ResponseWriter, r *http.Request) {
 			"one import is at most "+strconv.FormatInt(h.opt.MaxTotalBytes>>20, 10)+" MB: split the catalogue", map[string]int64{"totalBytes": total, "limitBytes": h.opt.MaxTotalBytes})
 		return
 	}
-	if h.opt.MinFreeBytes > 0 && active > 0 {
-		if free, ok := h.opt.FreeBytes(); ok {
-			need := audioBytes*7/2 + (total - audioBytes) // the originals, the playback copies and room to work
-			if free-need < h.opt.MinFreeBytes {
-				httpx.ErrorDetails(w, http.StatusInsufficientStorage, "insufficient_storage", "the server does not have enough free disk space for this import",
-					map[string]int64{"freeBytes": free, "needBytes": need, "keepFreeBytes": h.opt.MinFreeBytes})
-				return
-			}
-		}
-	}
-
 	tx, err := h.pool.Begin(ctx)
 	if err != nil {
 		serverError(w, err)
 		return
 	}
 	defer tx.Rollback(ctx) //nolint:errcheck
+	if active > 0 && h.opt.MinFreeBytes > 0 {
+		// held until the job is saved, so the next check counts it
+		if err := lockSpace(ctx, tx); err != nil {
+			serverError(w, err)
+			return
+		}
+		others, err := reserved(ctx, tx, "", true)
+		if err != nil {
+			serverError(w, err)
+			return
+		}
+		if !h.room(w, audioBytes*wholeSong/2+(total-audioBytes), others) {
+			return
+		}
+	}
 	var jobID string
 	var keyID *string
 	if p.KeyID != "" {
@@ -590,6 +604,9 @@ func (h *Handler) links(w http.ResponseWriter, r *http.Request) {
 		httpx.Error(w, http.StatusConflict, "not_pending", "this import is no longer waiting for files")
 		return
 	}
+	if !h.roomToSend(w, r, id) {
+		return
+	}
 	h.respond(w, r, id, http.StatusOK, true)
 }
 
@@ -643,7 +660,36 @@ func (h *Handler) start(w http.ResponseWriter, r *http.Request) {
 		httpx.ErrorDetails(w, http.StatusConflict, "files_missing", "some files have not arrived (or are larger than declared)", map[string]any{"missing": missing})
 		return
 	}
-	if _, err := h.pool.Exec(ctx, `UPDATE import_jobs SET status = 'processing', started_at = now() WHERE id = $1 AND status = 'awaiting_files'`, id); err != nil {
+	// the originals are on disk now; check that the playback copies still fit beside those of the started jobs
+	tx, err := h.pool.Begin(ctx)
+	if err != nil {
+		serverError(w, err)
+		return
+	}
+	defer tx.Rollback(ctx) //nolint:errcheck
+	if err := lockSpace(ctx, tx); err != nil {
+		serverError(w, err)
+		return
+	}
+	var copies int64
+	if err := tx.QueryRow(ctx, `SELECT (COALESCE(sum(f.actual_bytes), 0) * $2 / 2)::bigint FROM import_items i
+		JOIN import_files f ON f.job_id = i.job_id AND f.name = i.audio_file WHERE i.job_id = $1 AND i.status = 'pending'`, id, copiesDue).Scan(&copies); err != nil {
+		serverError(w, err)
+		return
+	}
+	started, err := reserved(ctx, tx, id, false)
+	if err != nil {
+		serverError(w, err)
+		return
+	}
+	if !h.room(w, copies, started) {
+		return // the job keeps waiting, with its files; start can be tried again
+	}
+	if _, err := tx.Exec(ctx, `UPDATE import_jobs SET status = 'processing', started_at = now() WHERE id = $1 AND status = 'awaiting_files'`, id); err != nil {
+		serverError(w, err)
+		return
+	}
+	if err := tx.Commit(ctx); err != nil {
 		serverError(w, err)
 		return
 	}
@@ -691,6 +737,14 @@ func removeStaged(ctx context.Context, blobs stagedBlobs, files []fileRow) {
 	}
 }
 
+// maxUnfinished bounds the unfinished list. Far more than the server's disk could hold.
+const maxUnfinished = 500
+
+// list answers with jobs, without per-track results. By default the 20 newest. state=unfinished gives all that are
+// not finished, so the queue is never cut off: first the started ones in the order the runner serves them (the
+// earliest start gets the free places first), then those still waiting for their files, oldest first.
+// state=finished pages through the ended ones, the latest to end first, with their total: a long queue of newer
+// jobs would otherwise push every finished one out of the 20.
 func (h *Handler) list(w http.ResponseWriter, r *http.Request) {
 	ctx := r.Context()
 	p := who(ctx)
@@ -698,7 +752,34 @@ func (h *Handler) list(w http.ResponseWriter, r *http.Request) {
 	if p.KeyID != "" {
 		mine = p.UserID
 	}
-	rows, err := h.pool.Query(ctx, `SELECT id FROM import_jobs WHERE $1 = '' OR created_by::text = $1 ORDER BY created_at DESC LIMIT 20`, mine)
+	query := `SELECT id FROM import_jobs WHERE $1 = '' OR created_by::text = $1 ORDER BY created_at DESC LIMIT 20`
+	args := []any{mine}
+	var total *int // only for the paged list
+	switch r.URL.Query().Get("state") {
+	case "":
+	case "finished":
+		limit, ok1 := pageParam(r, "limit", defaultPage, 1, maxPage)
+		offset, ok2 := pageParam(r, "offset", 0, 0, 1<<31-1)
+		if !ok1 || !ok2 {
+			httpx.Error(w, http.StatusBadRequest, "bad_request", "limit must be 1-100 and offset 0 or more")
+			return
+		}
+		const ended = ` FROM import_jobs WHERE ($1 = '' OR created_by::text = $1) AND status IN ('completed', 'completed_with_errors', 'failed', 'cancelled')`
+		total = new(int)
+		if err := h.pool.QueryRow(ctx, `SELECT count(*)`+ended, mine).Scan(total); err != nil {
+			serverError(w, err)
+			return
+		}
+		query = `SELECT id` + ended + ` ORDER BY COALESCE(finished_at, created_at) DESC, id DESC LIMIT $2 OFFSET $3`
+		args = append(args, limit, offset)
+	case "unfinished":
+		query = `SELECT id FROM import_jobs WHERE ($1 = '' OR created_by::text = $1) AND status IN ('processing', 'awaiting_files')
+			ORDER BY status = 'processing' DESC, started_at, CASE WHEN status = 'processing' THEN NULL ELSE created_at END, id LIMIT ` + strconv.Itoa(maxUnfinished)
+	default:
+		httpx.Error(w, http.StatusBadRequest, "bad_request", "state must be unfinished or finished, or left out")
+		return
+	}
+	rows, err := h.pool.Query(ctx, query, args...)
 	if err != nil {
 		serverError(w, err)
 		return
@@ -724,7 +805,26 @@ func (h *Handler) list(w http.ResponseWriter, r *http.Request) {
 		v.Results, v.Errors = nil, nil
 		out = append(out, v)
 	}
-	httpx.JSON(w, http.StatusOK, map[string]any{"imports": out})
+	answer := map[string]any{"imports": out}
+	if total != nil {
+		answer["total"] = *total
+	}
+	httpx.JSON(w, http.StatusOK, answer)
+}
+
+const (
+	defaultPage = 20
+	maxPage     = 100
+)
+
+// pageParam reads a whole number from the query: def when absent; ok is false when it is not a number in range.
+func pageParam(r *http.Request, name string, def, lowest, highest int) (int, bool) {
+	raw := r.URL.Query().Get(name)
+	if raw == "" {
+		return def, true
+	}
+	n, err := strconv.Atoi(raw)
+	return n, err == nil && n >= lowest && n <= highest
 }
 
 // diskFree is the free space of the disk the server runs on (the storage volume lives on the same disk).

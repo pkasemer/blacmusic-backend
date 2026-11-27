@@ -650,7 +650,7 @@ func (m *Manager) UpdateItem(ctx context.Context, userID, id, itemID string, p I
 		}
 	}
 	if p.Genre != nil {
-		if gen, err = genre.Normalize(*p.Genre); err != nil {
+		if gen, err = genre.NormalizeChange(*p.Genre, it.Genre); err != nil {
 			return nil, &ValidationError{err.Error()}
 		}
 	}

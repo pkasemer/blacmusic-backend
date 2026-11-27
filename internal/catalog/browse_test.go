@@ -138,7 +138,7 @@ func TestBrowseTracks(t *testing.T) {
 		t.Fatalf("unknown genre returned %v", ids(none))
 	}
 
-	if code, _ := browse(t, r, listener, "?sort=trending"); code != 400 {
+	if code, _ := browse(t, r, listener, "?sort=loudest"); code != 400 {
 		t.Fatalf("bad sort = %d, want 400", code)
 	}
 	if code, _ := browse(t, r, "garbage", ""); code != 401 {

@@ -1,0 +1,230 @@
+{
+  "languageGroups": [
+    {
+      "id": "runyakitara",
+      "label": "Runyakitara",
+      "description": "Western and Southwestern Uganda.",
+      "languages": [
+        {
+          "id": "runyankole",
+          "label": "Runyankole"
+        },
+        {
+          "id": "rukiga",
+          "label": "Rukiga"
+        },
+        {
+          "id": "runyoro",
+          "label": "Runyoro"
+        },
+        {
+          "id": "rutooro",
+          "label": "Rutooro"
+        }
+      ]
+    },
+    {
+      "id": "central_eastern_bantu",
+      "label": "Central and Eastern Bantu",
+      "description": "Central and Eastern Uganda.",
+      "languages": [
+        {
+          "id": "luganda",
+          "label": "Luganda"
+        },
+        {
+          "id": "lusoga",
+          "label": "Lusoga"
+        },
+        {
+          "id": "lugwere",
+          "label": "Lugwere"
+        },
+        {
+          "id": "luruuli",
+          "label": "Luruuli"
+        }
+      ]
+    },
+    {
+      "id": "luo",
+      "label": "Luo / Lwo",
+      "description": "Northern and Eastern Uganda.",
+      "languages": [
+        {
+          "id": "acholi",
+          "label": "Acholi"
+        },
+        {
+          "id": "lango",
+          "label": "Lango"
+        },
+        {
+          "id": "alur",
+          "label": "Alur"
+        },
+        {
+          "id": "kumam",
+          "label": "Kumam"
+        },
+        {
+          "id": "adhola",
+          "label": "Adhola (Jopadhola)"
+        }
+      ]
+    },
+    {
+      "id": "ateker",
+      "label": "Ateker",
+      "description": "Eastern and Northeastern Uganda.",
+      "languages": [
+        {
+          "id": "ateso",
+          "label": "Ateso"
+        },
+        {
+          "id": "ngakarimojong",
+          "label": "Ngakarimojong"
+        },
+        {
+          "id": "jie",
+          "label": "Jie"
+        },
+        {
+          "id": "dodoth",
+          "label": "Dodoth"
+        },
+        {
+          "id": "pokot",
+          "label": "Pokot"
+        }
+      ]
+    },
+    {
+      "id": "moru_madi",
+      "label": "Moru–Ma'di",
+      "description": "West Nile.",
+      "languages": [
+        {
+          "id": "lugbara",
+          "label": "Lugbara"
+        },
+        {
+          "id": "aringa",
+          "label": "Aringa"
+        },
+        {
+          "id": "madi",
+          "label": "Ma'di"
+        }
+      ]
+    },
+    {
+      "id": "national_international",
+      "label": "National and International",
+      "description": "Languages with wider national and regional reach.",
+      "languages": [
+        {
+          "id": "english",
+          "label": "English"
+        },
+        {
+          "id": "swahili",
+          "label": "Swahili"
+        }
+      ]
+    }
+  ],
+  "regions": [
+    {
+      "id": "western_uganda",
+      "label": "Western Uganda",
+      "areas": [
+        "Ankole",
+        "Kigezi",
+        "Bunyoro",
+        "Tooro"
+      ]
+    },
+    {
+      "id": "central_uganda",
+      "label": "Central Uganda",
+      "areas": [
+        "Buganda and surrounding communities"
+      ]
+    },
+    {
+      "id": "northern_uganda",
+      "label": "Northern Uganda",
+      "areas": [
+        "Acholi",
+        "Lango and surrounding communities"
+      ]
+    },
+    {
+      "id": "eastern_uganda",
+      "label": "Eastern Uganda",
+      "areas": [
+        "Teso",
+        "Busoga and surrounding communities"
+      ]
+    },
+    {
+      "id": "karamoja",
+      "label": "Karamoja",
+      "areas": [
+        "Karamoja musical traditions"
+      ]
+    },
+    {
+      "id": "west_nile",
+      "label": "West Nile",
+      "areas": [
+        "Lugbara",
+        "Ma'di and surrounding communities"
+      ]
+    }
+  ],
+  "genres": [
+    {
+      "id": "afrobeats",
+      "label": "Afrobeats"
+    },
+    {
+      "id": "afropop",
+      "label": "Afropop"
+    },
+    {
+      "id": "hip_hop",
+      "label": "Hip-Hop"
+    },
+    {
+      "id": "rnb",
+      "label": "R&B"
+    },
+    {
+      "id": "dancehall",
+      "label": "Dancehall"
+    },
+    {
+      "id": "gospel",
+      "label": "Gospel"
+    },
+    {
+      "id": "traditional",
+      "label": "Traditional"
+    },
+    {
+      "id": "kadongo_kamu",
+      "label": "Kadongo Kamu"
+    },
+    {
+      "id": "reggae",
+      "label": "Reggae"
+    },
+    {
+      "id": "amapiano",
+      "label": "Amapiano"
+    }
+  ]
+}

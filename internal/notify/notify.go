@@ -43,6 +43,15 @@ func TransferEnded(e transfer.Ended) (push.Message, string) {
 func OnTransferEnded(db push.DB) func(ctx context.Context, e transfer.Ended) error {
 	return func(ctx context.Context, e transfer.Ended) error {
 		m, key := TransferEnded(e)
+		// an import's releases may be waiting for the team rather than online
+		var waiting bool
+		if err := db.QueryRow(ctx, `SELECT EXISTS (SELECT 1 FROM release_reviews rr JOIN transfer_items ti ON ti.release_id = rr.release_id
+			WHERE ti.transfer_id = $1 AND rr.status = 'pending')`, e.TransferID).Scan(&waiting); err != nil {
+			return err
+		}
+		if waiting && e.Status == transfer.StatusCompleted {
+			m.Body = "Your YouTube import is done: our team will check your music before it goes live"
+		}
 		_, err := push.Enqueue(ctx, db, e.UserID, push.CategoryTransfers, m, key)
 		return err
 	}
@@ -128,9 +137,12 @@ func OnReleaseProcessed(ctx context.Context, tx pgx.Tx, e upload.ReadyEvent) err
 	} else {
 		body += "are "
 	}
-	if e.Live {
+	switch {
+	case e.Held:
+		body += "ready. Our team will check them before listeners can hear them."
+	case e.Live:
 		body += "now playing for your listeners."
-	} else {
+	default:
 		body += "ready. Open Blac Music to review it and publish when you are ready."
 	}
 	body += signoff

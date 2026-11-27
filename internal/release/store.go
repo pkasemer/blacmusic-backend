@@ -17,6 +17,9 @@ import (
 	"github.com/blacmusic/backend/internal/artist"
 	"github.com/blacmusic/backend/internal/genre"
 	"github.com/blacmusic/backend/internal/image"
+	"github.com/blacmusic/backend/internal/review"
+	"github.com/blacmusic/backend/internal/source"
+	"github.com/blacmusic/backend/internal/trackview"
 )
 
 var (
@@ -50,6 +53,9 @@ type Store struct {
 	publicURL string
 	// OnLive, when set, is called for every scheduled release that goes public (the worker sets it).
 	OnLive LiveHook
+	// Review: what artists publish or change in public waits for the team (see package review). The API and the
+	// worker set it; administrators and imports are never held.
+	Review bool
 	// OnPublish, when set, is called when an artist publishes a release right away (the API sets it).
 	OnPublish LiveHook
 }
@@ -83,6 +89,8 @@ type TrackView struct {
 	ArtistVerified bool `json:"artistVerified"`
 	HasLyrics      bool `json:"hasLyrics"`  // GET /v1/tracks/{id}/lyrics has something
 	HasCredits     bool `json:"hasCredits"` // the track or its release has credits
+	// FeaturedArtists are shown after the release's artist; absent when there are none.
+	FeaturedArtists []source.FeaturedArtist `json:"featuredArtists,omitempty"`
 }
 
 // UploadView is a file still on its way to becoming a track (owner only).
@@ -119,12 +127,19 @@ type Release struct {
 	PublishAt        *time.Time `json:"publishAt,omitempty"`
 	PublishedAt      *time.Time `json:"publishedAt,omitempty"`
 	Artist           *ArtistRef `json:"artist,omitempty"`
-	TrackCount       int        `json:"trackCount"`
-	Mine             bool       `json:"mine,omitempty"`
-	CreatedAt        time.Time  `json:"createdAt"`
+	// FeaturedArtists are shown after the artist; see trackview.ReleaseFeatured. Absent when there are none.
+	FeaturedArtists []source.FeaturedArtist `json:"featuredArtists,omitempty"`
+	TrackCount      int                     `json:"trackCount"`
+	Mine            bool                    `json:"mine,omitempty"`
+	CreatedAt       time.Time               `json:"createdAt"`
 
 	Tracks  []TrackView  `json:"tracks,omitempty"`
 	Uploads []UploadView `json:"uploads,omitempty"` // owner only: unfinished and failed files
+
+	// ReviewRequired (owner only): what this artist publishes or changes in public waits for the team.
+	ReviewRequired bool `json:"reviewRequired,omitempty"`
+	// Review (owner only): what is waiting or was refused.
+	Review *review.Info `json:"review,omitempty"`
 }
 
 const releaseSelect = `
@@ -135,7 +150,8 @@ const releaseSelect = `
 	       COALESCE(au.avatar_image_id, a.avatar_image_id), COALESCE(a.image_url, ''),
 	       (SELECT COALESCE(sum(t.duration_ms), 0) / 1000 FROM tracks t WHERE t.album_id = al.id),
 	       EXISTS (SELECT 1 FROM release_credits rc WHERE rc.release_id = al.id),
-	       al.taken_down_at IS NOT NULL, al.takedown_reason
+	       al.taken_down_at IS NOT NULL, al.takedown_reason,
+	       ` + trackview.ReleaseFeatured + `
 	FROM albums al LEFT JOIN artists a ON a.id = al.artist_id LEFT JOIN users au ON au.id = a.owner_user_id`
 
 func (s *Store) scanRelease(row pgx.Row, viewer string) (*Release, error) {
@@ -143,13 +159,17 @@ func (s *Store) scanRelease(row pgx.Row, viewer string) (*Release, error) {
 	var ar ArtistRef
 	var owner, legacyImage string
 	var avatarID *string
+	var featured []byte
 	err := row.Scan(&r.ID, &r.Type, &r.Title, &r.Description, &r.Genre, &r.ReleaseDate, &r.ArtworkURL, &r.Visibility,
 		&r.PublishAt, &r.PublishedAt, &r.CreatedAt, &ar.ID, &ar.Name, &ar.Verified, &owner, &r.TrackCount,
-		&avatarID, &legacyImage, &r.TotalDurationSec, &r.HasCredits, &r.TakenDown, &r.TakedownReason)
+		&avatarID, &legacyImage, &r.TotalDurationSec, &r.HasCredits, &r.TakenDown, &r.TakedownReason, &featured)
 	if errors.Is(err, pgx.ErrNoRows) {
 		return nil, ErrNotFound
 	}
 	if err != nil {
+		return nil, err
+	}
+	if r.FeaturedArtists, err = trackview.Featured(featured, s.publicURL); err != nil {
 		return nil, err
 	}
 	if ar.ID != "" {
@@ -194,7 +214,8 @@ func (s *Store) Get(ctx context.Context, id, viewer string) (*Release, error) {
 
 	q := `SELECT t.id, t.title, t.track_number, t.duration_ms, t.explicit, t.genre, t.visibility, t.loudness_lufs,
 	             EXISTS (SELECT 1 FROM track_lyrics tl WHERE tl.track_id = t.id),
-	             EXISTS (SELECT 1 FROM release_credits rc WHERE rc.track_id = t.id OR (rc.track_id IS NULL AND rc.release_id = t.album_id)) FROM tracks t
+	             EXISTS (SELECT 1 FROM release_credits rc WHERE rc.track_id = t.id OR (rc.track_id IS NULL AND rc.release_id = t.album_id)),
+	             featured_artists(t.id, t.album_id, t.artist_id) FROM tracks t
 	      WHERE t.album_id = $1`
 	if !r.Mine {
 		q += ` AND t.visibility = 'public'`
@@ -205,7 +226,12 @@ func (s *Store) Get(ctx context.Context, id, viewer string) (*Release, error) {
 	}
 	for rows.Next() {
 		var t TrackView
-		if err := rows.Scan(&t.ID, &t.Title, &t.TrackNumber, &t.DurationMs, &t.Explicit, &t.Genre, &t.Visibility, &t.LoudnessLufs, &t.HasLyrics, &t.HasCredits); err != nil {
+		var featured []byte
+		if err := rows.Scan(&t.ID, &t.Title, &t.TrackNumber, &t.DurationMs, &t.Explicit, &t.Genre, &t.Visibility, &t.LoudnessLufs, &t.HasLyrics, &t.HasCredits, &featured); err != nil {
+			rows.Close()
+			return nil, err
+		}
+		if t.FeaturedArtists, err = trackview.Featured(featured, s.publicURL); err != nil {
 			rows.Close()
 			return nil, err
 		}
@@ -246,7 +272,7 @@ func (s *Store) Get(ctx context.Context, id, viewer string) (*Release, error) {
 			return nil, err
 		}
 	}
-	return r, nil
+	return r, s.ownerReview(ctx, r)
 }
 
 func (s *Store) collect(rows pgx.Rows, viewer string) ([]*Release, error) {
@@ -342,11 +368,31 @@ func (s *Store) ListMine(ctx context.Context, userID string, limit, offset int) 
 	if err != nil {
 		return nil, err
 	}
-	return s.collect(rows, userID)
+	list, err := s.collect(rows, userID)
+	if err != nil {
+		return nil, err
+	}
+	for _, r := range list {
+		if err := s.ownerReview(ctx, r); err != nil {
+			return nil, err
+		}
+	}
+	return list, nil
 }
 
 // ListByArtist returns an artist's public releases, newest first.
-func (s *Store) ListByArtist(ctx context.Context, artistID, viewer string, limit, offset int) ([]*Release, error) {
+func (s *Store) ListByArtist(ctx context.Context, artistID, viewer, sort string, limit, offset int) ([]*Release, error) {
+	order := "al.release_date DESC NULLS LAST, al.published_at DESC, al.id"
+	switch sort {
+	case "", "new":
+	case "popular":
+		// the release as a whole: every counted play of its songs, plus saves of the release and of its songs
+		order = `((SELECT count(*) FROM signal_plays p WHERE p.release_id = al.id)
+		        + (SELECT count(*) FROM signal_album_saves la WHERE la.album_id = al.id)
+		        + (SELECT count(*) FROM signal_saves lt JOIN tracks tt ON tt.id = lt.track_id WHERE tt.album_id = al.id)) DESC, ` + order
+	default:
+		return nil, &ValidationError{"sort must be new or popular"}
+	}
 	var exists bool
 	if err := s.pool.QueryRow(ctx, `SELECT EXISTS (SELECT 1 FROM artists WHERE id = $1)`, artistID).Scan(&exists); err != nil {
 		return nil, err
@@ -355,7 +401,7 @@ func (s *Store) ListByArtist(ctx context.Context, artistID, viewer string, limit
 		return nil, ErrNotFound
 	}
 	rows, err := s.pool.Query(ctx, releaseSelect+` WHERE al.artist_id = $1 AND al.visibility = 'public'
-		ORDER BY al.release_date DESC NULLS LAST, al.published_at DESC, al.id LIMIT $2 OFFSET $3`, artistID, limit, offset)
+		ORDER BY `+order+` LIMIT $2 OFFSET $3`, artistID, limit, offset)
 	if err != nil {
 		return nil, err
 	}
@@ -365,18 +411,22 @@ func (s *Store) ListByArtist(ctx context.Context, artistID, viewer string, limit
 // Browse lists live releases for the home screen.
 //
 //	typ: "album" (albums and EPs), "single" or "all"
-//	sort: "new" (most recently released first) or "popular" (most saved by listeners)
+//	sort: "new" (most recently released first), "popular" (most saved by listeners) or "featured" (the albums and
+//	      EPs the team features, in the team's order)
 //
 // Only public releases that have something to play are returned.
 func (s *Store) Browse(ctx context.Context, sort, typ string, limit, offset int) ([]*Release, error) {
 	order := "COALESCE(al.published_at, al.created_at) DESC, al.id"
+	only := ""
 	switch sort {
+	case "featured":
+		order, only = "al.featured_position, al.id", " AND al.featured_position IS NOT NULL AND al.release_type = 'album'"
 	case "", "new":
 	case "popular":
-		order = `((SELECT count(*) FROM library_albums la WHERE la.album_id = al.id)
-		        + (SELECT count(*) FROM library_tracks lt JOIN tracks tt ON tt.id = lt.track_id WHERE tt.album_id = al.id)) DESC, ` + order
+		order = `((SELECT count(*) FROM signal_album_saves la WHERE la.album_id = al.id)
+		        + (SELECT count(*) FROM signal_saves lt JOIN tracks tt ON tt.id = lt.track_id WHERE tt.album_id = al.id)) DESC, ` + order
 	default:
-		return nil, &ValidationError{"sort must be new or popular"}
+		return nil, &ValidationError{"sort must be new, popular or featured"}
 	}
 	switch typ {
 	case "", "album", "single", "all":
@@ -389,7 +439,7 @@ func (s *Store) Browse(ctx context.Context, sort, typ string, limit, offset int)
 	rows, err := s.pool.Query(ctx, releaseSelect+`
 		WHERE al.visibility = 'public'
 		  AND EXISTS (SELECT 1 FROM tracks t WHERE t.album_id = al.id AND t.visibility = 'public')
-		  AND ($1 = 'all' OR al.release_type = $1)
+		  AND ($1 = 'all' OR al.release_type = $1)`+only+`
 		ORDER BY `+order+` LIMIT $2 OFFSET $3`, typ, limit, offset)
 	if err != nil {
 		return nil, err
@@ -542,6 +592,25 @@ func (s *Store) Update(ctx context.Context, id, userID string, p Patch) (*Releas
 	if cover != nil {
 		in.CoverImageID = *cover
 	}
+	if err := review.Locked(ctx, tx, id); err != nil {
+		return nil, err
+	}
+	// an online release keeps what listeners see; the edit goes on from what already waits
+	held := s.Review && visibility != "draft"
+	approved := in
+	if held {
+		waiting, err := review.Pending(ctx, tx, id)
+		if err != nil {
+			return nil, err
+		}
+		if waiting != nil {
+			for key, field := range editable(&in) {
+				if v, ok := waiting.Changes.Release[key]; ok {
+					*field = v
+				}
+			}
+		}
+	}
 
 	if p.Type != nil {
 		if *p.Type != in.Type && visibility != "draft" {
@@ -561,7 +630,7 @@ func (s *Store) Update(ctx context.Context, id, userID string, p Patch) (*Releas
 			if utf8.RuneCountInString(g) > 40 {
 				return nil, &ValidationError{"genre must be at most 40 characters"}
 			}
-			if g, err = genre.Normalize(g); err != nil {
+			if g, err = genre.NormalizeChange(g, in.Genre); err != nil {
 				return nil, err
 			}
 		}
@@ -589,7 +658,18 @@ func (s *Store) Update(ctx context.Context, id, userID string, p Patch) (*Releas
 		u := image.URL(s.publicURL, in.CoverImageID, image.SizeMedium)
 		coverID, coverURL = &in.CoverImageID, &u
 	}
-	if _, err := tx.Exec(ctx, `
+	if held {
+		staged := map[string]string{}
+		was := editable(&approved)
+		for key, now := range editable(&in) {
+			if *now != *was[key] {
+				staged[key] = *now
+			}
+		}
+		if err := review.Stage(ctx, tx, id, func(c *review.Changes) { c.Release = staged }); err != nil {
+			return nil, err
+		}
+	} else if _, err := tx.Exec(ctx, `
 		UPDATE albums SET release_type=$2, title=$3, description=$4, genre=$5, release_date=$6,
 		       cover_image_id=$7, artwork_url=$8, updated_at=now() WHERE id=$1`,
 		id, in.Type, in.Title, in.Description, in.Genre, newDate, coverID, coverURL); err != nil {
@@ -599,6 +679,12 @@ func (s *Store) Update(ctx context.Context, id, userID string, p Patch) (*Releas
 		return nil, err
 	}
 	return s.Get(ctx, id, userID)
+}
+
+// editable are the fields of a release that can wait for review, by their names in a waiting change.
+func editable(in *Input) map[string]*string {
+	return map[string]*string{"title": &in.Title, "description": &in.Description, "genre": &in.Genre,
+		"releaseDate": &in.ReleaseDate, "coverImageId": &in.CoverImageID}
 }
 
 // ----------------------------------------------------------------- publishing
@@ -673,6 +759,38 @@ func (s *Store) publish(ctx context.Context, id, userID string, publishAt *time.
 		return &ValidationError{"a single must have exactly one track (make it an album instead)"}
 	}
 
+	if userID != "" && s.Review && visibility == "draft" {
+		var at *time.Time
+		if publishAt != nil && publishAt.After(time.Now().Add(time.Minute)) {
+			if publishAt.After(time.Now().AddDate(1, 0, 0)) {
+				return &ValidationError{"publishAt must be within the next year"}
+			}
+			utc := publishAt.UTC()
+			at = &utc
+		}
+		if err := review.SubmitNew(ctx, tx, id, at); err != nil {
+			return err
+		}
+		return tx.Commit(ctx)
+	}
+	if userID == "" { // the team publishing it is its approval, of everything in it
+		for _, q := range []string{
+			`UPDATE artist_reviews SET status = 'approved', decided_at = now() WHERE status = 'pending' AND kind = 'new'
+			 AND artist_id = (SELECT artist_id FROM albums WHERE id = $1)`,
+			`UPDATE artists SET approved_at = now() WHERE approved_at IS NULL AND id = (SELECT artist_id FROM albums WHERE id = $1)`,
+		} {
+			if _, err := tx.Exec(ctx, q, id); err != nil {
+				return err
+			}
+		}
+		if _, err := tx.Exec(ctx, `UPDATE tracks SET review_hold = false WHERE album_id = $1`, id); err != nil {
+			return err
+		}
+		if _, err := tx.Exec(ctx, `UPDATE release_reviews SET status = 'approved', decided_at = now() WHERE release_id = $1 AND status = 'pending'`, id); err != nil {
+			return err
+		}
+	}
+
 	if publishAt != nil && publishAt.After(time.Now().Add(time.Minute)) {
 		if publishAt.After(time.Now().AddDate(1, 0, 0)) {
 			return &ValidationError{"publishAt must be within the next year"}
@@ -745,7 +863,7 @@ func goPublic(ctx context.Context, tx pgx.Tx, ids []string) error {
 		WHERE id = ANY($1)`, ids); err != nil {
 		return err
 	}
-	_, err := tx.Exec(ctx, `UPDATE tracks SET visibility = 'public' WHERE album_id = ANY($1)`, ids)
+	_, err := tx.Exec(ctx, `UPDATE tracks SET visibility = 'public' WHERE album_id = ANY($1) AND NOT review_hold`, ids)
 	return err
 }
 
@@ -781,6 +899,9 @@ func (s *Store) unpublish(ctx context.Context, id, userID string, audit func(ctx
 		return ErrNotFound
 	}
 	if err != nil {
+		return err
+	}
+	if err := s.settle(ctx, tx, id); err != nil {
 		return err
 	}
 	if _, err := tx.Exec(ctx, `UPDATE albums SET visibility = 'draft', publish_at = NULL, updated_at = now() WHERE id = $1`, id); err != nil {
@@ -852,22 +973,63 @@ type TrackPatch struct {
 	TrackNumber *int // 0 clears the number
 }
 
-// UpdateTrack edits a track the user's artist owns.
+// UpdateTrack edits a track the user's artist owns. A song listeners can hear keeps what they see until the team
+// approves the change.
 func (s *Store) UpdateTrack(ctx context.Context, id, userID string, p TrackPatch) (*TrackView, error) {
+	tx, err := s.pool.Begin(ctx)
+	if err != nil {
+		return nil, err
+	}
+	defer tx.Rollback(ctx) //nolint:errcheck
+	var releaseID, releaseVisibility string
+	var held bool
 	var t TrackView
-	var number *int
-	err := s.pool.QueryRow(ctx, `
-		SELECT t.title, t.explicit, t.genre, t.track_number, a.verification = 'verified',
-		       EXISTS (SELECT 1 FROM track_lyrics tl WHERE tl.track_id = t.id),
-		       EXISTS (SELECT 1 FROM release_credits rc WHERE rc.track_id = t.id OR (rc.track_id IS NULL AND rc.release_id = t.album_id))
-		FROM tracks t JOIN artists a ON a.id = t.artist_id
-		WHERE t.id = $1 AND a.owner_user_id = $2`, id, userID).Scan(&t.Title, &t.Explicit, &t.Genre, &number, &t.ArtistVerified, &t.HasLyrics, &t.HasCredits)
+	err = tx.QueryRow(ctx, `
+		SELECT COALESCE(t.album_id, '') FROM tracks t JOIN artists a ON a.id = t.artist_id WHERE t.id = $1 AND a.owner_user_id = $2`,
+		id, userID).Scan(&releaseID)
 	if errors.Is(err, pgx.ErrNoRows) {
 		return nil, ErrNotFound
 	}
 	if err != nil {
 		return nil, err
 	}
+	// the release's lock first, as a decision on it takes it
+	if err := tx.QueryRow(ctx, `SELECT visibility FROM albums WHERE id = $1 FOR UPDATE`, releaseID).Scan(&releaseVisibility); err != nil &&
+		!errors.Is(err, pgx.ErrNoRows) {
+		return nil, err
+	}
+	err = tx.QueryRow(ctx, `
+		SELECT t.id, t.title, t.explicit, t.genre, t.track_number, t.duration_ms, t.visibility, t.loudness_lufs, t.review_hold,
+		       a.verification = 'verified',
+		       EXISTS (SELECT 1 FROM track_lyrics tl WHERE tl.track_id = t.id),
+		       EXISTS (SELECT 1 FROM release_credits rc WHERE rc.track_id = t.id OR (rc.track_id IS NULL AND rc.release_id = t.album_id))
+		FROM tracks t JOIN artists a ON a.id = t.artist_id WHERE t.id = $1 FOR UPDATE OF t`, id).
+		Scan(&t.ID, &t.Title, &t.Explicit, &t.Genre, &t.TrackNumber, &t.DurationMs, &t.Visibility, &t.LoudnessLufs, &held,
+			&t.ArtistVerified, &t.HasLyrics, &t.HasCredits)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return nil, ErrNotFound
+	}
+	if err != nil {
+		return nil, err
+	}
+	if err := review.Locked(ctx, tx, releaseID); err != nil {
+		return nil, err
+	}
+	// a new song still hidden for review is edited as it is
+	waits := s.Review && !held && releaseVisibility != "" && releaseVisibility != "draft"
+	approved := t
+	if waits {
+		waiting, err := review.Pending(ctx, tx, releaseID)
+		if err != nil {
+			return nil, err
+		}
+		if waiting != nil {
+			if c, ok := waiting.Changes.Tracks[id]; ok {
+				applyToView(&t, c)
+			}
+		}
+	}
+
 	if p.Title != nil {
 		t.Title = strings.TrimSpace(*p.Title)
 	}
@@ -884,7 +1046,7 @@ func (s *Store) UpdateTrack(ctx context.Context, id, userID string, p TrackPatch
 				return nil, &ValidationError{"genre must be at most 40 characters"}
 			}
 			var gerr error
-			if g, gerr = genre.Normalize(g); gerr != nil {
+			if g, gerr = genre.NormalizeChange(g, t.Genre); gerr != nil {
 				return nil, gerr
 			}
 		}
@@ -895,20 +1057,54 @@ func (s *Store) UpdateTrack(ctx context.Context, id, userID string, p TrackPatch
 			return nil, &ValidationError{"trackNumber must be between 1 and 999"}
 		}
 		if *p.TrackNumber == 0 {
-			number = nil
+			t.TrackNumber = nil
 		} else {
-			number = p.TrackNumber
+			t.TrackNumber = p.TrackNumber
 		}
 	}
-	err = s.pool.QueryRow(ctx, `
-		UPDATE tracks SET title=$2, explicit=$3, genre=$4, track_number=$5 WHERE id=$1
-		RETURNING id, title, track_number, duration_ms, explicit, genre, visibility, loudness_lufs`,
-		id, t.Title, t.Explicit, t.Genre, number).
-		Scan(&t.ID, &t.Title, &t.TrackNumber, &t.DurationMs, &t.Explicit, &t.Genre, &t.Visibility, &t.LoudnessLufs)
+
+	if waits {
+		var c review.TrackChange
+		if t.Title != approved.Title {
+			c.Title = &t.Title
+		}
+		if t.Explicit != approved.Explicit {
+			c.Explicit = &t.Explicit
+		}
+		if t.Genre != approved.Genre {
+			c.Genre = &t.Genre
+		}
+		if number(t.TrackNumber) != number(approved.TrackNumber) {
+			n := number(t.TrackNumber)
+			c.TrackNumber = &n
+		}
+		err = review.Stage(ctx, tx, releaseID, func(all *review.Changes) {
+			if c == (review.TrackChange{}) {
+				delete(all.Tracks, id)
+				return
+			}
+			if all.Tracks == nil {
+				all.Tracks = map[string]review.TrackChange{}
+			}
+			all.Tracks[id] = c
+		})
+	} else {
+		if _, err = tx.Exec(ctx, `UPDATE tracks SET title=$2, explicit=$3, genre=$4, track_number=$5 WHERE id=$1`,
+			id, t.Title, t.Explicit, t.Genre, t.TrackNumber); err == nil && held {
+			err = review.Alter(ctx, tx, releaseID, nil)
+		}
+	}
 	if err != nil {
 		return nil, err
 	}
-	return &t, nil
+	return &t, tx.Commit(ctx)
+}
+
+func number(n *int) int {
+	if n == nil {
+		return 0
+	}
+	return *n
 }
 
 // DeleteTrack removes a track, its files and its place in anyone's library or
@@ -946,6 +1142,15 @@ func (s *Store) deleteTrack(ctx context.Context, id, userID string, audit func(c
 	keys, err := deleteTracks(ctx, tx, []string{id})
 	if err != nil {
 		return err
+	}
+	if albumID != nil {
+		if err := review.Alter(ctx, tx, *albumID, func(c *review.Changes) { c.Drop(id) }); err != nil {
+			return err
+		}
+		if _, err := tx.Exec(ctx, `UPDATE release_reviews SET status = 'withdrawn', decided_at = now()
+			WHERE release_id = $1 AND status = 'pending' AND kind = 'new' AND NOT EXISTS (SELECT 1 FROM tracks WHERE album_id = $1)`, *albumID); err != nil {
+			return err
+		}
 	}
 	if albumID != nil { // a release with nothing left in it cannot stay live
 		if _, err := tx.Exec(ctx, `

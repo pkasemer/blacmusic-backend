@@ -74,7 +74,7 @@ old_images() { # Blac Music image versions beyond the newest few
 tidy() {
   head_ "system log files the logger cannot write (this fills the journal with errors)"
   local f fixed=0
-  for f in "$ROOT"/var/log/{syslog,auth.log,kern.log,mail.log,user.log,cron.log}; do
+  for f in "$ROOT"/var/log/{syslog,auth.log,kern.log,mail.log,user.log,cron.log,ufw.log}; do
     [ -f "$f" ] && [ "$(stat -c %U "$f")" != syslog ] || continue
     run chown syslog:adm "$f"; run chmod 640 "$f"; fixed=1
   done

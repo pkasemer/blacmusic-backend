@@ -67,6 +67,8 @@ func User(t *testing.T, pool *pgxpool.Pool, role string, verified bool) string {
 		pool.Exec(c, `DELETE FROM tracks WHERE artist_id IN (SELECT id FROM artists WHERE owner_user_id = $1)`, id) //nolint:errcheck
 		pool.Exec(c, `DELETE FROM albums WHERE artist_id IN (SELECT id FROM artists WHERE owner_user_id = $1)`, id) //nolint:errcheck
 		pool.Exec(c, `DELETE FROM artists WHERE owner_user_id = $1`, id)                                            //nolint:errcheck
+		pool.Exec(c, `DELETE FROM uploads WHERE user_id = $1`, id)                                                  //nolint:errcheck
+		pool.Exec(c, `DELETE FROM images WHERE owner_id = $1`, id)                                                  //nolint:errcheck
 		pool.Exec(c, `DELETE FROM users WHERE id = $1`, id)                                                         //nolint:errcheck
 	})
 	return id

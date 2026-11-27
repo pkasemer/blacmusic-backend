@@ -22,14 +22,14 @@ func TestParseLRC(t *testing.T) {
 		"[00:12.34]First line\n" +
 		"[01:05.5][00:40]Chorus <00:41.00>words\n" +
 		"[00:20.123]  \n" + // an instrumental gap, kept
-		"no time stamp here\n" +
+		"\n" +
 		"[100:00.00]Very late\n" +
 		"[200:00.00]\n" // trailing empty line, dropped
-	lines, err := ParseLRC(src)
+	lines, err := ParseLRC(src, 0)
 	if err != nil {
 		t.Fatal(err)
 	}
-	want := []Line{{11840, "First line"}, {19623, ""}, {39500, "Chorus words"}, {65000, "Chorus words"}, {5999500, "Very late"}}
+	want := []Line{{TimeMs: 11840, Text: "First line"}, {TimeMs: 19623}, {TimeMs: 39500, Text: "Chorus words"}, {TimeMs: 65000, Text: "Chorus words"}, {TimeMs: 5999500, Text: "Very late"}}
 	if len(lines) != len(want) {
 		t.Fatalf("lines = %+v, want %+v", lines, want)
 	}
@@ -45,7 +45,7 @@ func TestParseLRC(t *testing.T) {
 		"long line":     "[00:01.00]" + strings.Repeat("x", MaxLineRunes+1),
 		"only tags":     "[ti:Song]\n[ar:Me]",
 	} {
-		if _, err := ParseLRC(bad); err == nil {
+		if _, err := ParseLRC(bad, 0); err == nil {
 			t.Errorf("%s accepted", name)
 		}
 	}
@@ -53,18 +53,18 @@ func TestParseLRC(t *testing.T) {
 	for i := 0; i <= MaxLines; i++ {
 		many.WriteString("[00:01.00]x\n")
 	}
-	if _, err := ParseLRC(many.String()); err == nil {
+	if _, err := ParseLRC(many.String(), 0); err == nil {
 		t.Error("too many lines accepted")
 	}
 }
 
 func TestBuildPlainAndTimed(t *testing.T) {
 	s := func(v string) *string { return &v }
-	l, err := Build(Input{Text: s("line one  \r\nline two\n\n\nline four\n\n")})
+	l, err := Build(Input{Text: s("line one  \r\nline two\n\n\nline four\n\n")}, 0)
 	if err != nil || l.Synced || l.Text != "line one\nline two\n\n\nline four" || l.Lines == nil || len(l.Lines) != 0 {
 		t.Fatalf("plain = %+v %v", l, err)
 	}
-	l, err = Build(Input{Text: s("ignored"), LRC: s("[00:01.00]hello\n[00:02.00]world")})
+	l, err = Build(Input{Text: s("ignored"), LRC: s("[00:01.00]hello\n[00:02.00]world")}, 0)
 	if err != nil || !l.Synced || l.Text != "hello\nworld" || len(l.Lines) != 2 {
 		t.Fatalf("timed = %+v %v (lrc must win over text)", l, err)
 	}
@@ -75,7 +75,7 @@ func TestBuildPlainAndTimed(t *testing.T) {
 		"bad lrc":   {LRC: s("not lrc")},
 		"blank lrc": {LRC: s("  ")},
 	} {
-		if _, err := Build(in); err == nil {
+		if _, err := Build(in, 0); err == nil {
 			t.Errorf("%s accepted", name)
 		}
 	}
